@@ -9,6 +9,7 @@ pub mod ipc;
 pub mod manifest;
 pub mod profile;
 pub mod recipe;
+pub mod sampling;
 pub mod tensor;
 
 pub use affinity::{
@@ -41,6 +42,7 @@ pub use profile::{
     QuantizationInfo, TuningAdvisory, TuningProfile,
 };
 pub use recipe::{ArchRecipe, ExecutionContext, KvCacheView, KvGeometry};
+pub use sampling::{SamplingParams, StopCriteria, StopReason, TokenSampler};
 pub use tensor::{BlockQ5_K, ModelWeights, QuantType, TensorShape, TensorView};
 
 #[cfg(test)]
