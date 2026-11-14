@@ -1,7 +1,294 @@
 //! Single-prompt execution context and architecture recipe traits (ADR-005, ADR-023, ADR-024).
 
+use core::ops::Range;
+
 use crate::error::K3Error;
+use crate::gguf::ModelMetadata;
 use crate::tensor::{ModelWeights, QuantType};
+
+/// Canonical layout dimensions for a contiguous `[layer][K|V][pos][kv_dim]` KV cache buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct KvGeometry {
+    /// Number of transformer layers owning KV cache planes.
+    pub num_layers: usize,
+    /// Number of key/value attention heads per layer.
+    pub n_heads_kv: usize,
+    /// Scalar dimension per key/value attention head.
+    pub head_dim: usize,
+    /// Maximum sequence capacity (`n_ctx`) along the sequence position axis.
+    pub seq_capacity: usize,
+    /// Optional sliding-window span limiting readable attention history.
+    pub sliding_window: Option<usize>,
+}
+
+impl KvGeometry {
+    /// Validates and constructs a [`KvGeometry`] descriptor.
+    ///
+    /// # Errors
+    /// Returns [`K3Error::TensorBoundsError`] if `num_layers`, `n_heads_kv`, `head_dim`,
+    /// or `seq_capacity` is zero, if `sliding_window == Some(0)`, or if the required buffer
+    /// element count overflows `usize`.
+    pub fn new(
+        num_layers: usize,
+        n_heads_kv: usize,
+        head_dim: usize,
+        seq_capacity: usize,
+        sliding_window: Option<usize>,
+    ) -> Result<Self, K3Error> {
+        let geom = Self {
+            num_layers,
+            n_heads_kv,
+            head_dim,
+            seq_capacity,
+            sliding_window,
+        };
+        geom.required_f32_len()?;
+        Ok(geom)
+    }
+
+    /// Returns the per-position vector width `n_heads_kv * head_dim`, checked against overflow.
+    ///
+    /// # Errors
+    /// Returns [`K3Error::TensorBoundsError`] if any dimension is zero or overflows `usize`.
+    pub fn kv_dim(&self) -> Result<usize, K3Error> {
+        if self.num_layers == 0
+            || self.n_heads_kv == 0
+            || self.head_dim == 0
+            || self.seq_capacity == 0
+            || self.sliding_window == Some(0)
+        {
+            return Err(K3Error::TensorBoundsError {
+                tensor_name: "kv_cache".to_owned(),
+                offset: 0,
+                byte_len: 0,
+                buffer_len: 0,
+                reason: "KvGeometry dimensions and optional sliding_window must be non-zero"
+                    .to_owned(),
+            });
+        }
+        self.n_heads_kv
+            .checked_mul(self.head_dim)
+            .ok_or_else(|| K3Error::TensorBoundsError {
+                tensor_name: "kv_cache".to_owned(),
+                offset: 0,
+                byte_len: usize::MAX,
+                buffer_len: 0,
+                reason: "KvGeometry kv_dim overflowed usize".to_owned(),
+            })
+    }
+
+    /// Returns the number of `f32` elements in a single K or V plane (`seq_capacity * kv_dim`).
+    ///
+    /// # Errors
+    /// Returns [`K3Error::TensorBoundsError`] on zero dimensions or `usize` overflow.
+    pub fn plane_len(&self) -> Result<usize, K3Error> {
+        let kv_dim = self.kv_dim()?;
+        self.seq_capacity
+            .checked_mul(kv_dim)
+            .ok_or_else(|| K3Error::TensorBoundsError {
+                tensor_name: "kv_cache".to_owned(),
+                offset: 0,
+                byte_len: usize::MAX,
+                buffer_len: 0,
+                reason: "KvGeometry plane_len overflowed usize".to_owned(),
+            })
+    }
+
+    /// Returns the exact total `f32` element count (`num_layers * 2 * seq_capacity * kv_dim`).
+    ///
+    /// # Errors
+    /// Returns [`K3Error::TensorBoundsError`] on zero dimensions or `usize` overflow.
+    pub fn required_f32_len(&self) -> Result<usize, K3Error> {
+        let plane = self.plane_len()?;
+        let layer_len = plane
+            .checked_mul(2)
+            .ok_or_else(|| K3Error::TensorBoundsError {
+                tensor_name: "kv_cache".to_owned(),
+                offset: 0,
+                byte_len: usize::MAX,
+                buffer_len: 0,
+                reason: "KvGeometry layer_len overflowed usize".to_owned(),
+            })?;
+        self.num_layers
+            .checked_mul(layer_len)
+            .ok_or_else(|| K3Error::TensorBoundsError {
+                tensor_name: "kv_cache".to_owned(),
+                offset: 0,
+                byte_len: usize::MAX,
+                buffer_len: 0,
+                reason: "KvGeometry required_f32_len overflowed usize".to_owned(),
+            })
+    }
+}
+
+/// Bounds-checked mutable view over a contiguous `[layer][K|V][pos][kv_dim]` KV cache buffer.
+#[derive(Debug)]
+pub struct KvCacheView<'a> {
+    buffer: &'a mut [f32],
+    geometry: KvGeometry,
+    kv_dim: usize,
+    plane_len: usize,
+}
+
+impl<'a> KvCacheView<'a> {
+    /// Creates a validated [`KvCacheView`] over `buffer` matching `geometry`.
+    ///
+    /// If `buffer` is larger than `geometry.required_f32_len()`, the view borrows only the exact
+    /// canonical prefix `[0..required_f32_len]`.
+    ///
+    /// # Errors
+    /// Returns [`K3Error::TensorBoundsError`] if `geometry` is invalid or `buffer.len()` is
+    /// smaller than the required element count.
+    pub fn new(buffer: &'a mut [f32], geometry: KvGeometry) -> Result<Self, K3Error> {
+        let kv_dim = geometry.kv_dim()?;
+        let plane_len = geometry.plane_len()?;
+        let required = geometry.required_f32_len()?;
+        if buffer.len() < required {
+            return Err(K3Error::TensorBoundsError {
+                tensor_name: "kv_cache".to_owned(),
+                offset: 0,
+                byte_len: required.saturating_mul(size_of::<f32>()),
+                buffer_len: size_of_val(buffer),
+                reason: format!(
+                    "kv_cache buffer length {} is smaller than required {} f32 elements",
+                    buffer.len(),
+                    required
+                ),
+            });
+        }
+        Ok(Self {
+            buffer: &mut buffer[..required],
+            geometry,
+            kv_dim,
+            plane_len,
+        })
+    }
+
+    /// Returns the underlying [`KvGeometry`].
+    #[must_use]
+    pub const fn geometry(&self) -> KvGeometry {
+        self.geometry
+    }
+
+    /// Returns the per-position vector width `n_heads_kv * head_dim`.
+    #[must_use]
+    pub const fn kv_dim(&self) -> usize {
+        self.kv_dim
+    }
+
+    /// Returns the length of a single K or V plane (`seq_capacity * kv_dim`).
+    #[must_use]
+    pub const fn plane_len(&self) -> usize {
+        self.plane_len
+    }
+
+    fn layer_offsets(&self, layer: usize) -> Result<(usize, usize, usize), K3Error> {
+        if layer >= self.geometry.num_layers {
+            return Err(K3Error::TensorBoundsError {
+                tensor_name: format!("kv_cache.layer.{layer}"),
+                offset: 0,
+                byte_len: self.plane_len * 2 * size_of::<f32>(),
+                buffer_len: size_of_val(self.buffer),
+                reason: format!(
+                    "layer index {layer} out of bounds for num_layers={}",
+                    self.geometry.num_layers
+                ),
+            });
+        }
+        let k_start = layer * 2 * self.plane_len;
+        let v_start = k_start + self.plane_len;
+        let layer_end = v_start + self.plane_len;
+        Ok((k_start, v_start, layer_end))
+    }
+
+    /// Returns immutable `(k_plane, v_plane)` slices for `layer`, each of length `seq_capacity * kv_dim`.
+    ///
+    /// # Errors
+    /// Returns [`K3Error::TensorBoundsError`] if `layer >= self.geometry().num_layers`.
+    pub fn layer_kv(&self, layer: usize) -> Result<(&[f32], &[f32]), K3Error> {
+        let (k_start, v_start, layer_end) = self.layer_offsets(layer)?;
+        Ok((
+            &self.buffer[k_start..v_start],
+            &self.buffer[v_start..layer_end],
+        ))
+    }
+
+    /// Returns simultaneous mutable `(k_plane, v_plane)` slices for `layer`, each of length
+    /// `seq_capacity * kv_dim`.
+    ///
+    /// # Errors
+    /// Returns [`K3Error::TensorBoundsError`] if `layer >= self.geometry().num_layers`.
+    pub fn layer_kv_mut(&mut self, layer: usize) -> Result<(&mut [f32], &mut [f32]), K3Error> {
+        let (k_start, _, _) = self.layer_offsets(layer)?;
+        let (_, layer_tail) = self.buffer.split_at_mut(k_start);
+        let (k_plane, v_tail) = layer_tail.split_at_mut(self.plane_len);
+        let (v_plane, _) = v_tail.split_at_mut(self.plane_len);
+        Ok((k_plane, v_plane))
+    }
+
+    /// Returns mutable `(k_slot, v_slot)` slices of length `kv_dim` for writing sequence position `pos`.
+    ///
+    /// # Errors
+    /// Returns [`K3Error::TensorBoundsError`] if `layer >= num_layers`, or
+    /// [`K3Error::ContextLengthExceeded`] if `pos >= seq_capacity`.
+    pub fn write_pos_range(
+        &mut self,
+        layer: usize,
+        pos: usize,
+    ) -> Result<(&mut [f32], &mut [f32]), K3Error> {
+        if pos >= self.geometry.seq_capacity {
+            return Err(K3Error::ContextLengthExceeded {
+                requested_tokens: pos.saturating_add(1),
+                max_context_tokens: self.geometry.seq_capacity,
+            });
+        }
+        let kv_dim = self.kv_dim;
+        let offset = pos * kv_dim;
+        let end = offset + kv_dim;
+        let (k_plane, v_plane) = self.layer_kv_mut(layer)?;
+        Ok((&mut k_plane[offset..end], &mut v_plane[offset..end]))
+    }
+
+    /// Returns the valid attention token index range up to `end_pos`, clamped by `sliding_window`
+    /// if configured (`[max(0, end_pos - window)..end_pos]`).
+    ///
+    /// # Errors
+    /// Returns [`K3Error::ContextLengthExceeded`] if `end_pos > seq_capacity`.
+    pub const fn valid_token_range(&self, end_pos: usize) -> Result<Range<usize>, K3Error> {
+        if end_pos > self.geometry.seq_capacity {
+            return Err(K3Error::ContextLengthExceeded {
+                requested_tokens: end_pos,
+                max_context_tokens: self.geometry.seq_capacity,
+            });
+        }
+        let start_pos = match self.geometry.sliding_window {
+            Some(window) => end_pos.saturating_sub(window),
+            None => 0,
+        };
+        Ok(start_pos..end_pos)
+    }
+
+    /// Returns immutable `(k_valid, v_valid)` slices covering the active attention history up to
+    /// `end_pos` (respecting `sliding_window` if configured) for `layer`.
+    ///
+    /// # Errors
+    /// Returns [`K3Error::ContextLengthExceeded`] if `end_pos > seq_capacity`, or
+    /// [`K3Error::TensorBoundsError`] if `layer >= num_layers`.
+    pub fn valid_kv_range(
+        &self,
+        layer: usize,
+        end_pos: usize,
+    ) -> Result<(&[f32], &[f32]), K3Error> {
+        let token_range = self.valid_token_range(end_pos)?;
+        let (k_plane, v_plane) = self.layer_kv(layer)?;
+        let elem_start = token_range.start * self.kv_dim;
+        let elem_end = token_range.end * self.kv_dim;
+        Ok((
+            &k_plane[elem_start..elem_end],
+            &v_plane[elem_start..elem_end],
+        ))
+    }
+}
 
 /// Single-prompt execution context enforcing strict cycle exclusivity (no cross-prompt batching
 /// per ADR-005) and fixed `n_ctx` context window bounds (per ADR-027).
@@ -14,6 +301,7 @@ pub struct ExecutionContext<'a> {
     n_ctx: usize,
     logits: &'a mut [f32],
     kv_cache: &'a mut [f32],
+    kv_geometry: Option<KvGeometry>,
 }
 
 impl<'a> ExecutionContext<'a> {
@@ -42,7 +330,33 @@ impl<'a> ExecutionContext<'a> {
             n_ctx,
             logits,
             kv_cache,
+            kv_geometry: None,
         })
+    }
+
+    /// Attaches a canonical [`KvGeometry`] layout descriptor and verifies the backing `kv_cache`
+    /// buffer is large enough to hold `[num_layers][K|V][seq_capacity][n_heads_kv * head_dim]`.
+    ///
+    /// # Errors
+    /// Returns [`K3Error::TensorBoundsError`] if `kv_geometry` has zero/overflowing dimensions or
+    /// if `self.kv_cache().len()` is smaller than `kv_geometry.required_f32_len()`.
+    pub fn with_kv_geometry(mut self, kv_geometry: KvGeometry) -> Result<Self, K3Error> {
+        let required = kv_geometry.required_f32_len()?;
+        if self.kv_cache.len() < required {
+            return Err(K3Error::TensorBoundsError {
+                tensor_name: "kv_cache".to_owned(),
+                offset: 0,
+                byte_len: required.saturating_mul(size_of::<f32>()),
+                buffer_len: size_of_val(self.kv_cache),
+                reason: format!(
+                    "kv_cache buffer length {} is smaller than required {} f32 elements",
+                    self.kv_cache.len(),
+                    required
+                ),
+            });
+        }
+        self.kv_geometry = Some(kv_geometry);
+        Ok(self)
     }
 
     /// Sets the starting KV sequence position cursor for this [`ExecutionContext`].
@@ -121,6 +435,27 @@ impl<'a> ExecutionContext<'a> {
     /// Returns simultaneous mutable views of the logits and KV cache buffers.
     pub fn buffers_mut(&mut self) -> (&mut [f32], &mut [f32]) {
         (self.logits, self.kv_cache)
+    }
+
+    /// Returns the configured [`KvGeometry`], if attached via [`Self::with_kv_geometry`].
+    #[must_use]
+    pub const fn kv_geometry(&self) -> Option<KvGeometry> {
+        self.kv_geometry
+    }
+
+    /// Returns a bounds-checked [`KvCacheView`] over the single-slot KV cache buffer when
+    /// [`Self::with_kv_geometry`] has been configured.
+    pub fn kv_view_mut(&mut self) -> Option<KvCacheView<'_>> {
+        let geom = self.kv_geometry?;
+        KvCacheView::new(self.kv_cache, geom).ok()
+    }
+
+    /// Returns simultaneous mutable views of the logits buffer and optional [`KvCacheView`].
+    pub fn logits_and_kv_view_mut(&mut self) -> (&mut [f32], Option<KvCacheView<'_>>) {
+        let kv_view = self
+            .kv_geometry
+            .and_then(|geom| KvCacheView::new(self.kv_cache, geom).ok());
+        (self.logits, kv_view)
     }
 
     /// Stages the next generated token for a single-token decode pass, verifying `position < n_ctx`.
@@ -219,6 +554,46 @@ pub trait ArchRecipe: Send + Sync + core::fmt::Debug {
     /// Returns `true` if this recipe and its linked kernel backend support `quant`.
     fn supports_quant(&self, quant: QuantType) -> bool;
 
+    /// Validates per-tensor quantization admission and resident weight invariants before execution.
+    ///
+    /// Checks every tensor in `metadata.tensors()` (and any resident weight tensors resolvable
+    /// when `weights.tensor_count() > 0`) against [`Self::supports_quant`], returning
+    /// [`K3Error::CapabilityMismatch`] naming the tensor and unsupported [`QuantType`].
+    ///
+    /// # Fail-Closed Weight Invariant
+    /// Recipes validated against loaded model weights (`weights.tensor_count() > 0`) **must**
+    /// fail closed on missing, mismatched, or unsupported tensors and must **never** silently
+    /// synthesize fallback weights or identity projections to keep running.
+    ///
+    /// # Errors
+    /// Returns [`K3Error::CapabilityMismatch`] if any tensor uses an unsupported quantization format.
+    fn validate_model(
+        &self,
+        metadata: &ModelMetadata,
+        weights: &dyn ModelWeights,
+    ) -> Result<(), K3Error> {
+        for desc in metadata.tensors() {
+            if !self.supports_quant(desc.quant()) {
+                return Err(K3Error::unsupported_tensor_quant(
+                    metadata.architecture(),
+                    desc.name(),
+                    desc.quant(),
+                ));
+            }
+            if weights.tensor_count() > 0
+                && let Ok(view) = weights.tensor(desc.name())
+                && !self.supports_quant(view.quant())
+            {
+                return Err(K3Error::unsupported_tensor_quant(
+                    metadata.architecture(),
+                    view.name(),
+                    view.quant(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Executes a single-pass classification or logit-harvest pass over [`ExecutionContext::prompt_tokens`].
     ///
     /// Defaults to delegating to [`ArchRecipe::prefill_step`]. Encoder-only recipes override this
@@ -257,4 +632,209 @@ pub trait ArchRecipe: Send + Sync + core::fmt::Debug {
         ctx: &mut ExecutionContext<'_>,
         weights: &dyn ModelWeights,
     ) -> Result<(), K3Error>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gguf::{GgufFile, GgufValue, test_helpers::create_synthetic_gguf_v3_with_kvs};
+    use crate::tensor::TensorView;
+
+    #[derive(Debug)]
+    struct Q4OnlyMockRecipe;
+
+    impl ArchRecipe for Q4OnlyMockRecipe {
+        fn architecture_id(&self) -> &'static str {
+            "llama"
+        }
+
+        fn supports_quant(&self, quant: QuantType) -> bool {
+            matches!(quant, QuantType::F32 | QuantType::Q4_0)
+        }
+
+        fn prefill_step(
+            &self,
+            _ctx: &mut ExecutionContext<'_>,
+            _weights: &dyn ModelWeights,
+        ) -> Result<(), K3Error> {
+            Ok(())
+        }
+
+        fn decode_step(
+            &self,
+            _ctx: &mut ExecutionContext<'_>,
+            _weights: &dyn ModelWeights,
+        ) -> Result<(), K3Error> {
+            Ok(())
+        }
+    }
+
+    struct EmptyMockWeights;
+
+    impl ModelWeights for EmptyMockWeights {
+        fn tensor(&self, name: &str) -> Result<TensorView<'_>, K3Error> {
+            Err(K3Error::TensorBoundsError {
+                tensor_name: name.to_owned(),
+                offset: 0,
+                byte_len: 0,
+                buffer_len: 0,
+                reason: "empty mock".to_owned(),
+            })
+        }
+
+        fn tensor_count(&self) -> usize {
+            0
+        }
+
+        fn total_weight_bytes(&self) -> usize {
+            0
+        }
+    }
+
+    #[test]
+    fn test_validate_model_rejects_mixed_quant_tensor_fail_closed() {
+        let kvs = [
+            ("llama.block_count", GgufValue::Uint32(1)),
+            ("llama.embedding_length", GgufValue::Uint32(32)),
+            ("llama.attention.head_count", GgufValue::Uint32(2)),
+        ];
+
+        // 1. Accepted: F32 norms + Q4_0 projection on Q4OnlyMockRecipe
+        let supported_gguf_bytes = create_synthetic_gguf_v3_with_kvs(
+            "llama",
+            32,
+            &kvs,
+            &[
+                ("blk.0.attn_norm.weight", QuantType::F32, &[32]),
+                ("blk.0.attn_q.weight", QuantType::Q4_0, &[32, 32]),
+            ],
+        );
+        let supported_gguf = GgufFile::parse(&supported_gguf_bytes).expect("parse supported gguf");
+        Q4OnlyMockRecipe
+            .validate_model(supported_gguf.metadata(), &supported_gguf)
+            .expect("F32 + Q4_0 should pass Q4OnlyMockRecipe");
+
+        // 2. Rejected: F32 norms + Q8_0 weights on Q4OnlyMockRecipe
+        let mixed_gguf_bytes = create_synthetic_gguf_v3_with_kvs(
+            "llama",
+            32,
+            &kvs,
+            &[
+                ("blk.0.attn_norm.weight", QuantType::F32, &[32]),
+                ("blk.0.attn_q.weight", QuantType::Q8_0, &[32, 32]),
+            ],
+        );
+        let mixed_gguf = GgufFile::parse(&mixed_gguf_bytes).expect("parse mixed gguf");
+
+        for weights in [
+            &mixed_gguf as &dyn ModelWeights,
+            &EmptyMockWeights as &dyn ModelWeights,
+        ] {
+            let err = Q4OnlyMockRecipe
+                .validate_model(mixed_gguf.metadata(), weights)
+                .expect_err("Q8_0 weight must fail Q4OnlyMockRecipe");
+            match err {
+                K3Error::CapabilityMismatch {
+                    architecture,
+                    reason,
+                } => {
+                    assert_eq!(architecture, "llama");
+                    assert!(
+                        reason.contains("blk.0.attn_q.weight"),
+                        "expected tensor name in reason: {reason}"
+                    );
+                    assert!(
+                        reason.contains("Q8_0"),
+                        "expected quant type in reason: {reason}"
+                    );
+                }
+                other => panic!("expected CapabilityMismatch, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_kv_cache_view_layer_pos_and_sliding_window_miri_clean() {
+        let geom = KvGeometry::new(2, 2, 4, 6, Some(3)).expect("valid kv geometry");
+        assert_eq!(geom.kv_dim().unwrap(), 8);
+        assert_eq!(geom.plane_len().unwrap(), 48);
+        assert_eq!(geom.required_f32_len().unwrap(), 192);
+
+        let mut raw_kv = vec![0.0_f32; geom.required_f32_len().unwrap() + 16];
+        let mut logits = [0.0_f32; 8];
+        let mut ctx = ExecutionContext::new(&[1, 2], 6, &mut logits, &mut raw_kv)
+            .expect("execution context")
+            .with_kv_geometry(geom)
+            .expect("attach kv geometry");
+
+        assert_eq!(ctx.kv_geometry(), Some(geom));
+        {
+            let mut kv_view = ctx.kv_view_mut().expect("kv view must exist");
+            for layer in 0..2 {
+                for pos in 0..5 {
+                    let (k_slot, v_slot) = kv_view
+                        .write_pos_range(layer, pos)
+                        .expect("write position slot");
+                    assert_eq!(k_slot.len(), 8);
+                    assert_eq!(v_slot.len(), 8);
+                    #[allow(clippy::cast_precision_loss)]
+                    let base = (layer * 100 + pos * 10) as f32;
+                    k_slot.fill(base + 1.0);
+                    v_slot.fill(base + 2.0);
+                }
+            }
+
+            // Sliding window W=3 at end_pos=5 keeps positions 2, 3, 4 (24 floats per plane)
+            assert_eq!(kv_view.valid_token_range(5).unwrap(), 2..5);
+            let (k_valid, v_valid) = kv_view.valid_kv_range(1, 5).expect("valid kv range");
+            assert_eq!(k_valid.len(), 3 * 8);
+            assert_eq!(v_valid.len(), 3 * 8);
+            assert!((k_valid[0] - 121.0).abs() < f32::EPSILON);
+            assert!((k_valid[8] - 131.0).abs() < f32::EPSILON);
+            assert!((k_valid[16] - 141.0).abs() < f32::EPSILON);
+            assert!((v_valid[16] - 142.0).abs() < f32::EPSILON);
+
+            // At end_pos=2 < W=3, window starts at 0
+            assert_eq!(kv_view.valid_token_range(2).unwrap(), 0..2);
+            let (k_early, _) = kv_view.valid_kv_range(0, 2).expect("early kv range");
+            assert_eq!(k_early.len(), 16);
+            assert!((k_early[0] - 1.0).abs() < f32::EPSILON);
+
+            // Bounds checks reject out-of-range layers and positions
+            assert!(matches!(
+                kv_view.layer_kv(2),
+                Err(K3Error::TensorBoundsError { .. })
+            ));
+            assert!(matches!(
+                kv_view.write_pos_range(0, 6),
+                Err(K3Error::ContextLengthExceeded { .. })
+            ));
+            assert!(matches!(
+                kv_view.valid_kv_range(0, 7),
+                Err(K3Error::ContextLengthExceeded { .. })
+            ));
+        }
+
+        // Backward compatibility: raw kv_cache() and kv_cache_mut() remain usable
+        assert_eq!(ctx.kv_cache().len(), 192 + 16);
+        ctx.kv_cache_mut()[0] = 42.0;
+        assert!((ctx.kv_cache()[0] - 42.0).abs() < f32::EPSILON);
+
+        // Zero dimensions and short backing buffers fail closed
+        assert!(matches!(
+            KvGeometry::new(0, 2, 4, 6, None),
+            Err(K3Error::TensorBoundsError { .. })
+        ));
+        assert!(matches!(
+            KvGeometry::new(2, 2, 4, 6, Some(0)),
+            Err(K3Error::TensorBoundsError { .. })
+        ));
+        let mut too_short = [0.0_f32; 16];
+        let short_ctx =
+            ExecutionContext::new(&[1], 6, &mut logits, &mut too_short).expect("execution context");
+        assert!(matches!(
+            short_ctx.with_kv_geometry(geom),
+            Err(K3Error::TensorBoundsError { .. })
+        ));
+    }
 }

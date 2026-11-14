@@ -68,6 +68,11 @@ fn test_all_14_fory_message_schemas_round_trip() {
         arena_bytes: 4 * 1024 * 1024 * 1024,
         n_ctx: 4096,
         max_blocks: 256,
+        num_layers: 28,
+        head_count_kv: 4,
+        head_dim: 128,
+        vocab_size: 152_064,
+        kv_dtype: 0,
     });
     assert_eq!(schema_1.type_id(), 101);
     let (t1, bytes1) = schema_1.serialize(fory).expect("serialize schema 1");
@@ -296,6 +301,11 @@ fn test_uds_frame_transmission_without_fd() {
         arena_bytes: 256 * 1024 * 1024,
         n_ctx: 2048,
         max_blocks: 128,
+        num_layers: 28,
+        head_count_kv: 2,
+        head_dim: 128,
+        vocab_size: 151_936,
+        kv_dtype: 1,
     });
     send_msg_frame(&stream_a, &req, None).expect("send_msg_frame without fd");
 
@@ -677,6 +687,11 @@ fn test_adversarial_boundary_and_unicode_payloads() {
         arena_bytes: u64::MAX,
         n_ctx: u32::MAX,
         max_blocks: u32::MAX,
+        num_layers: u32::MAX,
+        head_count_kv: u32::MAX,
+        head_dim: u32::MAX,
+        vocab_size: u32::MAX,
+        kv_dtype: u8::MAX,
     });
     let (t_uni, b_uni) = msg_unicode
         .serialize(fory)

@@ -130,8 +130,8 @@ fn test_q5_k_variant_existence_and_ggml_mapping() {
     assert_eq!(QuantType::from_gguf_type_id(13), Some(QuantType::Q5_K));
 
     // 3. Negative type ID mapping check
-    assert_eq!(QuantType::from_gguf_type_id(11), None);
     assert_eq!(QuantType::from_gguf_type_id(15), None);
+    assert_eq!(QuantType::from_gguf_type_id(37), None);
     assert_eq!(QuantType::from_gguf_type_id(999), None);
 
     // 4. Trait implementations: Copy, Clone, PartialEq, Eq, Hash

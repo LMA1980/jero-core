@@ -2,15 +2,18 @@
 
 use core::fmt;
 
+use crate::tensor::QuantType;
+
 /// Structured diagnostic error covering capability mismatches, lockable memory admission,
 /// context window bounds, CPU core affinity, and zero-copy tensor view bounds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum K3Error {
-    /// Model architecture or quantization format is not supported by compiled recipes/kernels (ADR-023).
+    /// Model architecture or per-tensor quantization format is not supported by compiled
+    /// recipes or kernels (ADR-023).
     CapabilityMismatch {
         /// The model architecture identifier (e.g. from GGUF `general.architecture`).
         architecture: String,
-        /// Detailed explanation of the unsupported capability or quantization format.
+        /// Detailed explanation of the unsupported capability or tensor quantization format.
         reason: String,
     },
     /// Required model weight + KV cache footprint exceeds lockable physical memory (ADR-037, US-01 Scenario 3).
@@ -74,6 +77,22 @@ pub enum K3Error {
 }
 
 impl K3Error {
+    /// Constructs a [`Self::CapabilityMismatch`] error for an unsupported tensor quantization format.
+    #[must_use]
+    pub fn unsupported_tensor_quant(
+        architecture: impl Into<String>,
+        tensor_name: &str,
+        quant: QuantType,
+    ) -> Self {
+        Self::CapabilityMismatch {
+            architecture: architecture.into(),
+            reason: format!(
+                "tensor '{tensor_name}' uses unsupported quantization format {quant}",
+                quant = quant.as_str()
+            ),
+        }
+    }
+
     /// Returns the machine-readable diagnostic error code for structured reporting.
     #[must_use]
     pub const fn diagnostic_code(&self) -> &'static str {
