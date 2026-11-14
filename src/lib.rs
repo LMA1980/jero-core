@@ -10,6 +10,7 @@ pub mod manifest;
 pub mod profile;
 pub mod recipe;
 pub mod sampling;
+pub mod scratch;
 pub mod tensor;
 
 pub use affinity::{
@@ -29,9 +30,10 @@ pub use gguf::{
     TensorDescriptor, align_up,
 };
 pub use ipc::{
-    ArenaHeader, ArenaOptions, ArenaSocketExt, IpcError, IpcMessage, KvBlockMeta, KvBlockTag,
+    ArenaHeader, ArenaOptions, ArenaSocketExt, IpcError, IpcMessage, KV_DTYPE_F16, KV_DTYPE_F32,
+    KV_DTYPE_Q8_0, KV_Q8_0_BLOCK_BYTES, KV_Q8_0_BLOCK_ELEMENTS, KvBlockMeta, KvBlockTag, KvDtype,
     OutputSlabHeader, RecurrentStateSlotHeader, SharedMemoryArena, StatusCode,
-    TokenInputSlotHeader,
+    TokenInputSlotHeader, estimate_recurrent_state_bytes,
 };
 pub use manifest::ModelManifest;
 pub use profile::{
@@ -43,6 +45,9 @@ pub use profile::{
 };
 pub use recipe::{ArchRecipe, ExecutionContext, KvCacheView, KvGeometry};
 pub use sampling::{SamplingParams, StopCriteria, StopReason, TokenSampler};
+pub use scratch::{
+    SCRATCH_ALIGNMENT, ScratchCheckpoint, ScratchElement, ScratchScope, ScratchWorkspace,
+};
 pub use tensor::{BlockQ5_K, ModelWeights, QuantType, TensorShape, TensorView};
 
 #[cfg(test)]

@@ -12,17 +12,19 @@ pub use arrow::{
 };
 pub use layout::{
     ARENA_MAGIC, ARENA_MAGIC_BYTES, ARENA_VERSION, ArenaHeader, BLOCK_SIZE_TOKENS,
-    CACHELINE_ALIGNMENT, KvBlockMeta, KvBlockTag, OutputSlabHeader, RecurrentStateSlotHeader,
-    SLAB_STATUS_IDLE, SLAB_STATUS_READ, SLAB_STATUS_WRITTEN, TAG_FREE, TAG_PERSIST, TAG_PURGE,
-    TAG_VOLATILE, TokenInputSlotHeader,
+    CACHELINE_ALIGNMENT, KV_Q8_0_BLOCK_BYTES, KV_Q8_0_BLOCK_ELEMENTS, KvBlockMeta, KvBlockTag,
+    KvDtype, OutputSlabHeader, RecurrentStateSlotHeader, SLAB_STATUS_IDLE, SLAB_STATUS_READ,
+    SLAB_STATUS_WRITTEN, TAG_FREE, TAG_PERSIST, TAG_PURGE, TAG_VOLATILE, TokenInputSlotHeader,
+    estimate_recurrent_state_bytes,
 };
 pub use protocol::{
     AllocateArenaRequest, AllocateArenaResponse, AttachArenaCommand, DeallocateArenaRequest,
     DeallocateArenaResponse, FLAG_ERROR, FLAG_FD_ATTACHED, FLAG_RESPONSE, FRAME_HEADER_LEN,
     FRAME_MAGIC, ForwardPassCommand, ForwardPassCompleted, GetArenaFdRequest, GetArenaFdResponse,
-    IpcFrameHeader, IpcMessage, MAX_PAYLOAD_LEN, PingRequest, PingResponse, ShutdownCommand,
-    StatusCode, WorkerHeartbeatRequest, WorkerHeartbeatResponse, create_fory_codec,
-    create_uds_socket_pair, global_fory, recv_frame, recv_msg_frame, send_frame, send_msg_frame,
+    IpcFrameHeader, IpcMessage, KV_DTYPE_F16, KV_DTYPE_F32, KV_DTYPE_Q8_0, MAX_PAYLOAD_LEN,
+    PingRequest, PingResponse, ShutdownCommand, StatusCode, WorkerHeartbeatRequest,
+    WorkerHeartbeatResponse, create_fory_codec, create_uds_socket_pair, global_fory, recv_frame,
+    recv_msg_frame, send_frame, send_msg_frame,
 };
 pub use shm::{
     ArenaOptions, ArenaSocketExt, DEFAULT_LIMIT_MEMLOCK_BYTES, DEFAULT_PAGE_SIZE, IpcError,
