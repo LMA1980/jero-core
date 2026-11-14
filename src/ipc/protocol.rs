@@ -106,8 +106,15 @@ impl StatusCode {
 // Memory Management Commands (k3-kv <-> k3-manager)
 // ============================================================================
 
+/// KV cache storage dtype: 32-bit IEEE float (`kv_dtype = 0`, wire default).
+pub const KV_DTYPE_F32: u8 = 0;
+/// KV cache storage dtype: 16-bit IEEE float (`kv_dtype = 1`).
+pub const KV_DTYPE_F16: u8 = 1;
+/// KV cache storage dtype: 8-bit block-quantized (`kv_dtype = 2`).
+pub const KV_DTYPE_Q8_0: u8 = 2;
+
 /// Type ID: 101 — Request to allocate a shared memory arena.
-#[derive(ForyStruct, Debug, Clone, PartialEq, Eq)]
+#[derive(ForyStruct, serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct AllocateArenaRequest {
     /// Logical model identifier.
     pub model_id: String,
@@ -117,6 +124,60 @@ pub struct AllocateArenaRequest {
     pub n_ctx: u32,
     /// Maximum number of 16-token KV blocks.
     pub max_blocks: u32,
+    /// Transformer layer count allocated in the KV arena.
+    #[serde(default)]
+    pub num_layers: u32,
+    /// Number of key/value attention heads per layer.
+    #[serde(default)]
+    pub head_count_kv: u32,
+    /// Scalar dimension per attention key/value head.
+    #[serde(default)]
+    pub head_dim: u32,
+    /// Model vocabulary size for logits buffer sizing.
+    #[serde(default)]
+    pub vocab_size: u32,
+    /// KV cache element encoding (`0 = F32`, `1 = F16`, `2 = Q8_0`).
+    #[serde(default)]
+    pub kv_dtype: u8,
+}
+
+impl AllocateArenaRequest {
+    /// Validates that all arena capacities and model geometry dimensions are strictly non-zero
+    /// and that `kv_dtype` identifies a supported encoding (`0 = F32`, `1 = F16`, `2 = Q8_0`).
+    ///
+    /// # Errors
+    /// Returns a static diagnostic string naming the invalid field without synthesizing
+    /// fallback non-zero dimensions.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.model_id.trim().is_empty() {
+            return Err("AllocateArenaRequest.model_id must not be empty");
+        }
+        if self.arena_bytes == 0 {
+            return Err("AllocateArenaRequest.arena_bytes must be greater than zero");
+        }
+        if self.n_ctx == 0 {
+            return Err("AllocateArenaRequest.n_ctx must be greater than zero");
+        }
+        if self.max_blocks == 0 {
+            return Err("AllocateArenaRequest.max_blocks must be greater than zero");
+        }
+        if self.num_layers == 0 {
+            return Err("AllocateArenaRequest.num_layers must be greater than zero");
+        }
+        if self.head_count_kv == 0 {
+            return Err("AllocateArenaRequest.head_count_kv must be greater than zero");
+        }
+        if self.head_dim == 0 {
+            return Err("AllocateArenaRequest.head_dim must be greater than zero");
+        }
+        if self.vocab_size == 0 {
+            return Err("AllocateArenaRequest.vocab_size must be greater than zero");
+        }
+        if self.kv_dtype > KV_DTYPE_Q8_0 {
+            return Err("AllocateArenaRequest.kv_dtype must be 0 (F32), 1 (F16), or 2 (Q8_0)");
+        }
+        Ok(())
+    }
 }
 
 /// Type ID: 102 — Response to arena allocation request.
@@ -760,6 +821,11 @@ mod tests {
             arena_bytes: 1024 * 1024,
             n_ctx: 128,
             max_blocks: 8,
+            num_layers: 28,
+            head_count_kv: 4,
+            head_dim: 128,
+            vocab_size: 151_936,
+            kv_dtype: KV_DTYPE_F32,
         });
         let (t1, b1) = req1.serialize(fory).expect("serialize req1");
         assert_eq!(t1, 101);
@@ -902,5 +968,82 @@ mod tests {
             StatusCode::from_k3_error(&mem_err),
             StatusCode::InsufficientLockableMemory
         );
+    }
+
+    #[test]
+    fn test_allocate_arena_request_geometry_validation_and_wire_compat() {
+        let valid = AllocateArenaRequest {
+            model_id: "llama-3-8b".to_owned(),
+            arena_bytes: 64 * 1024 * 1024,
+            n_ctx: 4096,
+            max_blocks: 256,
+            num_layers: 32,
+            head_count_kv: 8,
+            head_dim: 128,
+            vocab_size: 128_256,
+            kv_dtype: KV_DTYPE_F16,
+        };
+        assert!(valid.validate().is_ok());
+
+        // Serde JSON wire compatibility when new trailing geometry fields are omitted.
+        let legacy_json = r#"{"model_id":"legacy","arena_bytes":4096,"n_ctx":64,"max_blocks":4}"#;
+        let decoded: AllocateArenaRequest =
+            serde_json::from_str(legacy_json).expect("decode legacy AllocateArenaRequest JSON");
+        assert_eq!(decoded.num_layers, 0);
+        assert_eq!(decoded.head_count_kv, 0);
+        assert_eq!(decoded.head_dim, 0);
+        assert_eq!(decoded.vocab_size, 0);
+        assert_eq!(decoded.kv_dtype, KV_DTYPE_F32);
+        // Must reject zero geometry rather than synthesizing hidden defaults.
+        assert!(decoded.validate().is_err());
+
+        // Full Fory binary round-trip preserves all geometry and dtype values.
+        let fory = global_fory();
+        for kv_dtype in [KV_DTYPE_F32, KV_DTYPE_F16, KV_DTYPE_Q8_0] {
+            let mut msg_req = valid.clone();
+            msg_req.kv_dtype = kv_dtype;
+            assert!(msg_req.validate().is_ok());
+            let envelope = IpcMessage::AllocateArenaRequest(msg_req);
+            let (tid, payload) = envelope.serialize(fory).expect("serialize");
+            let round_tripped = IpcMessage::deserialize(tid, &payload, fory).expect("deserialize");
+            assert_eq!(round_tripped, envelope);
+        }
+
+        // Field-by-field non-zero validation checks and invalid kv_dtype rejection.
+        let mut empty_id = valid.clone();
+        empty_id.model_id = "  ".to_owned();
+        assert!(empty_id.validate().is_err());
+
+        let mut zero_arena = valid.clone();
+        zero_arena.arena_bytes = 0;
+        assert!(zero_arena.validate().is_err());
+
+        let mut zero_ctx = valid.clone();
+        zero_ctx.n_ctx = 0;
+        assert!(zero_ctx.validate().is_err());
+
+        let mut zero_blocks = valid.clone();
+        zero_blocks.max_blocks = 0;
+        assert!(zero_blocks.validate().is_err());
+
+        let mut zero_layers = valid.clone();
+        zero_layers.num_layers = 0;
+        assert!(zero_layers.validate().is_err());
+
+        let mut zero_heads = valid.clone();
+        zero_heads.head_count_kv = 0;
+        assert!(zero_heads.validate().is_err());
+
+        let mut zero_dim = valid.clone();
+        zero_dim.head_dim = 0;
+        assert!(zero_dim.validate().is_err());
+
+        let mut zero_vocab = valid.clone();
+        zero_vocab.vocab_size = 0;
+        assert!(zero_vocab.validate().is_err());
+
+        let mut bad_dtype = valid;
+        bad_dtype.kv_dtype = 3;
+        assert!(bad_dtype.validate().is_err());
     }
 }

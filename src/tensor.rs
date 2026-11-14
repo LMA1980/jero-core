@@ -16,18 +16,36 @@ pub enum QuantType {
     BF16,
     /// 4-bit round-to-nearest quantization in blocks of 32 elements (`ggml_type = 2`).
     Q4_0,
+    /// 4-bit quantization with per-block scale and minimum in blocks of 32 elements (`ggml_type = 3`).
+    Q4_1,
+    /// 5-bit quantization without minimum in blocks of 32 elements (`ggml_type = 6`).
+    Q5_0,
+    /// 5-bit quantization with per-block scale and minimum in blocks of 32 elements (`ggml_type = 7`).
+    Q5_1,
     /// 8-bit round-to-nearest quantization in blocks of 32 elements (`ggml_type = 8`).
     Q8_0,
+    /// 8-bit quantization with weighted block sum in blocks of 32 elements (`ggml_type = 9`).
+    Q8_1,
+    /// 2-bit K-quant super-blocks of 256 elements (`ggml_type = 10`).
+    Q2_K,
+    /// 3-bit K-quant super-blocks of 256 elements (`ggml_type = 11`).
+    Q3_K,
     /// 4-bit K-quant super-blocks of 256 elements (`ggml_type = 12`, primary format for `Q4_K_M`).
     Q4_K_M,
     /// 5-bit K-quant super-blocks of 256 elements (`ggml_type = 13`, used by `Q5_K_M` and `Q5_K_S`).
     Q5_K,
     /// 6-bit K-quant super-blocks of 256 elements (`ggml_type = 14`, used by mixed `Q4_K_M` tensors).
     Q6_K,
+    /// 4-bit non-linear integer quantization in blocks of 32 elements (`ggml_type = 20`).
+    IQ4_NL,
     /// 1.58-bit base-3 ternary quantization in blocks of 256 elements (`ggml_type = 34`).
     TQ1_0,
     /// 2-bit ternary quantization in blocks of 256 elements (`ggml_type = 35`).
     TQ2_0,
+    /// BitNet.cpp 2-bit packed ternary format in blocks of 128 elements plus a 32-byte scale trailer (`ggml_type = 36`).
+    I2_S,
+    /// OCP Microscaling FP4 (E2M1) in blocks of 32 elements with shared E8M0 exponent (`ggml_type = 39`).
+    MXFP4,
 }
 
 impl QuantType {
@@ -39,12 +57,21 @@ impl QuantType {
             Self::F16 => "F16",
             Self::BF16 => "BF16",
             Self::Q4_0 => "Q4_0",
+            Self::Q4_1 => "Q4_1",
+            Self::Q5_0 => "Q5_0",
+            Self::Q5_1 => "Q5_1",
             Self::Q8_0 => "Q8_0",
+            Self::Q8_1 => "Q8_1",
+            Self::Q2_K => "Q2_K",
+            Self::Q3_K => "Q3_K",
             Self::Q4_K_M => "Q4_K_M",
             Self::Q5_K => "Q5_K",
             Self::Q6_K => "Q6_K",
+            Self::IQ4_NL => "IQ4_NL",
             Self::TQ1_0 => "TQ1_0",
             Self::TQ2_0 => "TQ2_0",
+            Self::I2_S => "I2_S",
+            Self::MXFP4 => "MXFP4",
         }
     }
 
@@ -55,13 +82,22 @@ impl QuantType {
             0 => Some(Self::F32),
             1 => Some(Self::F16),
             2 => Some(Self::Q4_0),
+            3 => Some(Self::Q4_1),
+            6 => Some(Self::Q5_0),
+            7 => Some(Self::Q5_1),
             8 => Some(Self::Q8_0),
+            9 => Some(Self::Q8_1),
+            10 => Some(Self::Q2_K),
+            11 => Some(Self::Q3_K),
             12 => Some(Self::Q4_K_M),
             13 => Some(Self::Q5_K),
             14 => Some(Self::Q6_K),
+            20 => Some(Self::IQ4_NL),
             30 => Some(Self::BF16),
             34 => Some(Self::TQ1_0),
             35 => Some(Self::TQ2_0),
+            36 => Some(Self::I2_S),
+            39 => Some(Self::MXFP4),
             _ => None,
         }
     }
@@ -73,13 +109,22 @@ impl QuantType {
             Self::F32 => 0,
             Self::F16 => 1,
             Self::Q4_0 => 2,
+            Self::Q4_1 => 3,
+            Self::Q5_0 => 6,
+            Self::Q5_1 => 7,
             Self::Q8_0 => 8,
+            Self::Q8_1 => 9,
+            Self::Q2_K => 10,
+            Self::Q3_K => 11,
             Self::Q4_K_M => 12,
             Self::Q5_K => 13,
             Self::Q6_K => 14,
+            Self::IQ4_NL => 20,
             Self::BF16 => 30,
             Self::TQ1_0 => 34,
             Self::TQ2_0 => 35,
+            Self::I2_S => 36,
+            Self::MXFP4 => 39,
         }
     }
 
@@ -100,8 +145,22 @@ impl QuantType {
     pub const fn block_elements(&self) -> usize {
         match self {
             Self::F32 | Self::F16 | Self::BF16 => 1,
-            Self::Q4_0 | Self::Q8_0 => 32,
-            Self::Q4_K_M | Self::Q5_K | Self::Q6_K | Self::TQ1_0 | Self::TQ2_0 => 256,
+            Self::Q4_0
+            | Self::Q4_1
+            | Self::Q5_0
+            | Self::Q5_1
+            | Self::Q8_0
+            | Self::Q8_1
+            | Self::IQ4_NL
+            | Self::MXFP4 => 32,
+            Self::I2_S => 128,
+            Self::Q2_K
+            | Self::Q3_K
+            | Self::Q4_K_M
+            | Self::Q5_K
+            | Self::Q6_K
+            | Self::TQ1_0
+            | Self::TQ2_0 => 256,
         }
     }
 
@@ -117,13 +176,21 @@ impl QuantType {
         match self {
             Self::F32 => 4,
             Self::F16 | Self::BF16 => 2,
-            Self::Q4_0 => 18,
+            Self::Q4_0 | Self::IQ4_NL => 18,
+            Self::Q4_1 => 20,
+            Self::Q5_0 => 22,
+            Self::Q5_1 => 24,
             Self::Q8_0 => 34,
+            Self::Q8_1 => 36,
+            Self::Q2_K => 84,
+            Self::Q3_K => 110,
             Self::Q4_K_M => 144,
             Self::Q5_K => 176,
             Self::Q6_K => 210,
             Self::TQ1_0 => 54,
             Self::TQ2_0 => 66,
+            Self::I2_S => 32,
+            Self::MXFP4 => 17,
         }
     }
 
@@ -143,9 +210,33 @@ impl QuantType {
     #[must_use]
     pub const fn alignment(&self) -> usize {
         match self {
-            Self::F32 => 4,
-            Self::F16 | Self::BF16 | Self::Q4_0 | Self::Q8_0 => 2,
-            Self::Q4_K_M | Self::Q5_K | Self::Q6_K | Self::TQ1_0 | Self::TQ2_0 => 16,
+            Self::MXFP4 => 1,
+            Self::F32 | Self::Q8_1 => 4,
+            Self::F16
+            | Self::BF16
+            | Self::Q4_0
+            | Self::Q4_1
+            | Self::Q5_0
+            | Self::Q5_1
+            | Self::Q8_0
+            | Self::IQ4_NL => 2,
+            Self::Q2_K
+            | Self::Q3_K
+            | Self::Q4_K_M
+            | Self::Q5_K
+            | Self::Q6_K
+            | Self::TQ1_0
+            | Self::TQ2_0 => 16,
+            Self::I2_S => 32,
+        }
+    }
+
+    /// Returns the fixed trailing scale metadata size in bytes appended after all packed blocks.
+    #[must_use]
+    pub const fn scale_trailer_bytes(&self) -> usize {
+        match self {
+            Self::I2_S => 32,
+            _ => 0,
         }
     }
 
@@ -182,6 +273,7 @@ impl QuantType {
         let num_blocks = num_elements / block_elems;
         num_blocks
             .checked_mul(self.block_bytes())
+            .and_then(|packed_bytes| packed_bytes.checked_add(self.scale_trailer_bytes()))
             .ok_or_else(|| K3Error::TensorBoundsError {
                 tensor_name: tensor_name.to_owned(),
                 offset: 0,
@@ -1181,18 +1273,30 @@ mod tests {
             (0, Some(QuantType::F32)),
             (1, Some(QuantType::F16)),
             (2, Some(QuantType::Q4_0)),
+            (3, Some(QuantType::Q4_1)),
+            (6, Some(QuantType::Q5_0)),
+            (7, Some(QuantType::Q5_1)),
             (8, Some(QuantType::Q8_0)),
+            (9, Some(QuantType::Q8_1)),
+            (10, Some(QuantType::Q2_K)),
+            (11, Some(QuantType::Q3_K)),
             (12, Some(QuantType::Q4_K_M)),
             (13, Some(QuantType::Q5_K)),
             (14, Some(QuantType::Q6_K)),
+            (20, Some(QuantType::IQ4_NL)),
             (30, Some(QuantType::BF16)),
             (34, Some(QuantType::TQ1_0)),
             (35, Some(QuantType::TQ2_0)),
-            (3, None),
+            (36, Some(QuantType::I2_S)),
+            (39, Some(QuantType::MXFP4)),
             (4, None),
+            (5, None),
+            (15, None),
             (31, None),
             (33, None),
-            (36, None),
+            (37, None),
+            (38, None),
+            (40, None),
             (999, None),
         ];
         for (id, expected) in expected_mappings {
@@ -1423,5 +1527,83 @@ mod tests {
             view_2d.slice_expert(0, 1),
             Err(K3Error::TensorBoundsError { .. })
         ));
+    }
+
+    #[test]
+    fn test_mixed_quant_and_bitnet_i2_s_descriptors() {
+        let specs = [
+            (QuantType::Q4_1, 3_u32, "Q4_1", 32_usize, 20_usize, 2_usize),
+            (QuantType::Q5_0, 6_u32, "Q5_0", 32_usize, 22_usize, 2_usize),
+            (QuantType::Q5_1, 7_u32, "Q5_1", 32_usize, 24_usize, 2_usize),
+            (QuantType::Q8_1, 9_u32, "Q8_1", 32_usize, 36_usize, 4_usize),
+            (
+                QuantType::Q2_K,
+                10_u32,
+                "Q2_K",
+                256_usize,
+                84_usize,
+                16_usize,
+            ),
+            (
+                QuantType::Q3_K,
+                11_u32,
+                "Q3_K",
+                256_usize,
+                110_usize,
+                16_usize,
+            ),
+            (
+                QuantType::IQ4_NL,
+                20_u32,
+                "IQ4_NL",
+                32_usize,
+                18_usize,
+                2_usize,
+            ),
+            (
+                QuantType::I2_S,
+                36_u32,
+                "I2_S",
+                128_usize,
+                32_usize,
+                32_usize,
+            ),
+            (
+                QuantType::MXFP4,
+                39_u32,
+                "MXFP4",
+                32_usize,
+                17_usize,
+                1_usize,
+            ),
+        ];
+
+        for (quant, type_id, name, block_elems, block_bytes, alignment) in specs {
+            assert_eq!(QuantType::from_gguf_type_id(type_id), Some(quant));
+            assert_eq!(quant.ggml_type_id(), type_id);
+            assert_eq!(quant.as_str(), name);
+            assert_eq!(quant.block_elements(), block_elems);
+            assert_eq!(quant.block_bytes(), block_bytes);
+            assert_eq!(quant.alignment(), alignment);
+            assert!(quant.is_quantized());
+            let single_block = quant
+                .storage_bytes("w", block_elems)
+                .expect("single block size");
+            assert_eq!(single_block, block_bytes + quant.scale_trailer_bytes());
+        }
+
+        // Authentic BitNet b1.58 2B4T I2_S footprint: (elems / 4) packed + 32-byte trailing scale.
+        assert_eq!(
+            QuantType::I2_S
+                .storage_bytes("blk.0.attn_q.weight", 1_638_400)
+                .expect("I2_S tensor byte size"),
+            409_632
+        );
+        assert_eq!(
+            QuantType::I2_S
+                .storage_bytes("blk.0.ffn_gate.weight", 17_694_720)
+                .expect("I2_S FFN tensor byte size"),
+            4_423_712
+        );
     }
 }

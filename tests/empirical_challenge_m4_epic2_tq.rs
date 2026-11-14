@@ -33,13 +33,22 @@ fn test_adversarial_gguf_type_id_mapping_exhaustive() {
         (QuantType::F32, 0, "F32", 1, 4),
         (QuantType::F16, 1, "F16", 1, 2),
         (QuantType::Q4_0, 2, "Q4_0", 32, 18),
+        (QuantType::Q4_1, 3, "Q4_1", 32, 20),
+        (QuantType::Q5_0, 6, "Q5_0", 32, 22),
+        (QuantType::Q5_1, 7, "Q5_1", 32, 24),
         (QuantType::Q8_0, 8, "Q8_0", 32, 34),
+        (QuantType::Q8_1, 9, "Q8_1", 32, 36),
+        (QuantType::Q2_K, 10, "Q2_K", 256, 84),
+        (QuantType::Q3_K, 11, "Q3_K", 256, 110),
         (QuantType::Q4_K_M, 12, "Q4_K_M", 256, 144),
         (QuantType::Q5_K, 13, "Q5_K", 256, 176),
         (QuantType::Q6_K, 14, "Q6_K", 256, 210),
+        (QuantType::IQ4_NL, 20, "IQ4_NL", 32, 18),
         (QuantType::BF16, 30, "BF16", 1, 2),
         (QuantType::TQ1_0, 34, "TQ1_0", 256, 54),
         (QuantType::TQ2_0, 35, "TQ2_0", 256, 66),
+        (QuantType::I2_S, 36, "I2_S", 128, 32),
+        (QuantType::MXFP4, 39, "MXFP4", 32, 17),
     ];
 
     let mut recognized_ids = HashSet::new();

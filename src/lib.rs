@@ -40,7 +40,7 @@ pub use profile::{
     ModelListResponse, ModelLoadAuditEvent, ModelProfile, PriorityClass, ProfileStatus,
     QuantizationInfo, TuningAdvisory, TuningProfile,
 };
-pub use recipe::{ArchRecipe, ExecutionContext};
+pub use recipe::{ArchRecipe, ExecutionContext, KvCacheView, KvGeometry};
 pub use tensor::{BlockQ5_K, ModelWeights, QuantType, TensorShape, TensorView};
 
 #[cfg(test)]

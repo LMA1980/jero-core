@@ -220,6 +220,33 @@ pub enum GgufArray<'a> {
     Float64(Vec<f64>),
 }
 
+impl GgufArray<'_> {
+    /// Returns the number of elements stored in this homogeneous GGUF metadata array.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Uint8(items) => items.len(),
+            Self::Int8(items) => items.len(),
+            Self::Uint16(items) => items.len(),
+            Self::Int16(items) => items.len(),
+            Self::Uint32(items) => items.len(),
+            Self::Int32(items) => items.len(),
+            Self::Float32(items) => items.len(),
+            Self::Bool(items) => items.len(),
+            Self::String(items) => items.len(),
+            Self::Uint64(items) => items.len(),
+            Self::Int64(items) => items.len(),
+            Self::Float64(items) => items.len(),
+        }
+    }
+
+    /// Returns `true` if this GGUF metadata array contains zero elements.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
 /// Internal helper for zero-copy reading from a byte slice.
 struct BinaryCursor<'a> {
     buffer: &'a [u8],
@@ -976,6 +1003,14 @@ pub struct ModelMetadata {
     residual_scale: Option<f32>,
     attention_scale: Option<f32>,
     logit_scale: Option<f32>,
+    feed_forward_length: Option<usize>,
+    rope_freq_base: Option<f32>,
+    rope_dimension_count: Option<usize>,
+    rms_norm_eps: Option<f32>,
+    sliding_window: Option<usize>,
+    vocab_size: Option<usize>,
+    attn_logit_softcapping: Option<f32>,
+    final_logit_softcapping: Option<f32>,
 }
 
 impl ModelMetadata {
@@ -1175,6 +1210,66 @@ impl ModelMetadata {
     #[must_use]
     pub const fn logit_scale(&self) -> Option<f32> {
         self.logit_scale
+    }
+
+    /// Returns the MLP feed-forward intermediate dimension (`{arch}.feed_forward_length`), if present.
+    #[must_use]
+    pub const fn feed_forward_length(&self) -> Option<usize> {
+        self.feed_forward_length
+    }
+
+    /// Returns the explicit attention key head dimension (`{arch}.attention.key_length`), if present.
+    #[must_use]
+    pub const fn key_length(&self) -> Option<usize> {
+        self.qk_nope_head_dim
+    }
+
+    /// Returns the explicit attention value head dimension (`{arch}.attention.value_length`), if present.
+    #[must_use]
+    pub const fn value_length(&self) -> Option<usize> {
+        self.v_head_dim
+    }
+
+    /// Returns the `RoPE` base frequency (`{arch}.rope.freq_base`), if present.
+    #[must_use]
+    pub const fn rope_freq_base(&self) -> Option<f32> {
+        self.rope_freq_base
+    }
+
+    /// Returns the `RoPE` rotary dimension count (`{arch}.rope.dimension_count`), if present.
+    #[must_use]
+    pub const fn rope_dimension_count(&self) -> Option<usize> {
+        self.rope_dimension_count
+    }
+
+    /// Returns the RMS normalization epsilon (`{arch}.attention.layer_norm_rms_epsilon`), if present.
+    #[must_use]
+    pub const fn rms_norm_eps(&self) -> Option<f32> {
+        self.rms_norm_eps
+    }
+
+    /// Returns the sliding-window attention span in tokens (`{arch}.attention.sliding_window`), if present.
+    #[must_use]
+    pub const fn sliding_window(&self) -> Option<usize> {
+        self.sliding_window
+    }
+
+    /// Returns the vocabulary size (`{arch}.vocab_size` or `tokenizer.ggml.tokens` array length), if present.
+    #[must_use]
+    pub const fn vocab_size(&self) -> Option<usize> {
+        self.vocab_size
+    }
+
+    /// Returns the Gemma2-style attention logit softcapping threshold (`{arch}.attn_logit_softcapping`), if present.
+    #[must_use]
+    pub const fn attn_logit_softcapping(&self) -> Option<f32> {
+        self.attn_logit_softcapping
+    }
+
+    /// Returns the Gemma2-style final logit softcapping threshold (`{arch}.final_logit_softcapping`), if present.
+    #[must_use]
+    pub const fn final_logit_softcapping(&self) -> Option<f32> {
+        self.final_logit_softcapping
     }
 
     /// Overrides the `MLA` compressed KV latent dimensions on this [`ModelMetadata`].
@@ -1473,6 +1568,20 @@ impl<'a> GgufFile<'a> {
         let residual_scale = lookup_f32("residual_scale");
         let attention_scale = lookup_f32("attention.scale");
         let logit_scale = lookup_f32("logit_scale");
+        let feed_forward_length = lookup_usize("feed_forward_length");
+        let rope_freq_base = lookup_f32("rope.freq_base");
+        let rope_dimension_count = lookup_usize("rope.dimension_count");
+        let rms_norm_eps = lookup_f32("attention.layer_norm_rms_epsilon");
+        let sliding_window = lookup_usize("attention.sliding_window");
+        let vocab_size = lookup_usize("vocab_size").or_else(|| {
+            metadata_map
+                .get("tokenizer.ggml.tokens")
+                .and_then(GgufValue::as_array)
+                .map(GgufArray::len)
+                .filter(|&len| len > 0)
+        });
+        let attn_logit_softcapping = lookup_f32("attn_logit_softcapping");
+        let final_logit_softcapping = lookup_f32("final_logit_softcapping");
 
         let metadata = ModelMetadata {
             architecture,
@@ -1507,6 +1616,14 @@ impl<'a> GgufFile<'a> {
             residual_scale,
             attention_scale,
             logit_scale,
+            feed_forward_length,
+            rope_freq_base,
+            rope_dimension_count,
+            rms_norm_eps,
+            sliding_window,
+            vocab_size,
+            attn_logit_softcapping,
+            final_logit_softcapping,
         };
 
         Ok(Self {
@@ -2086,19 +2203,7 @@ pub mod test_helpers {
                 buf.extend_from_slice(&dim_u64.to_le_bytes());
             }
 
-            // Map QuantType to ggml_type ID
-            let ggml_type_id: u32 = match quant {
-                QuantType::F32 => 0,
-                QuantType::F16 => 1,
-                QuantType::Q4_0 => 2,
-                QuantType::Q8_0 => 8,
-                QuantType::Q4_K_M => 12,
-                QuantType::Q5_K => 13,
-                QuantType::Q6_K => 14,
-                QuantType::BF16 => 30,
-                QuantType::TQ1_0 => 34,
-                QuantType::TQ2_0 => 35,
-            };
+            let ggml_type_id: u32 = quant.ggml_type_id();
             buf.extend_from_slice(&ggml_type_id.to_le_bytes());
             let rel_offset_u64 = u64::try_from(rel_offset).expect("rel_offset fits u64");
             buf.extend_from_slice(&rel_offset_u64.to_le_bytes());
@@ -2705,5 +2810,191 @@ mod tests {
         assert_eq!(g.ssm_state_size(), Some(128));
         assert_eq!(g.ssm_time_step_rank(), Some(48));
         assert_eq!(g.ssm_group_count(), Some(1));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn test_model_metadata_wave1_hyperparameters_across_architectures() {
+        // 1. LLaMA with explicit llama.vocab_size
+        let llama_kvs = [
+            ("llama.block_count", GgufValue::Uint32(32)),
+            ("llama.embedding_length", GgufValue::Uint32(4096)),
+            ("llama.feed_forward_length", GgufValue::Uint32(14336)),
+            ("llama.attention.head_count", GgufValue::Uint32(32)),
+            ("llama.attention.head_count_kv", GgufValue::Uint32(8)),
+            ("llama.attention.key_length", GgufValue::Uint32(128)),
+            ("llama.attention.value_length", GgufValue::Uint32(128)),
+            ("llama.rope.freq_base", GgufValue::Float32(500_000.0)),
+            ("llama.rope.dimension_count", GgufValue::Uint32(128)),
+            (
+                "llama.attention.layer_norm_rms_epsilon",
+                GgufValue::Float32(1e-5),
+            ),
+            ("llama.vocab_size", GgufValue::Uint32(128_256)),
+        ];
+        let llama_bytes = create_synthetic_gguf_v3_with_kvs(
+            "llama",
+            32,
+            &llama_kvs,
+            &[("blk.0.attn_q.weight", QuantType::Q4_1, &[128, 128])],
+        );
+        let llama = GgufFile::parse(&llama_bytes).expect("parse llama gguf");
+        let lm = llama.metadata();
+        assert_eq!(lm.feed_forward_length(), Some(14336));
+        assert_eq!(lm.key_length(), Some(128));
+        assert_eq!(lm.value_length(), Some(128));
+        assert_eq!(lm.rope_freq_base(), Some(500_000.0));
+        assert_eq!(lm.rope_dimension_count(), Some(128));
+        assert_eq!(lm.rms_norm_eps(), Some(1e-5));
+        assert_eq!(lm.sliding_window(), None);
+        assert_eq!(lm.vocab_size(), Some(128_256));
+        assert_eq!(lm.attn_logit_softcapping(), None);
+        assert_eq!(lm.final_logit_softcapping(), None);
+
+        // 2. Qwen2 with tokenizer.ggml.tokens array fallback for vocab_size
+        let qwen_tokens = vec!["<|endoftext|>", "a", "b", "c", "d"];
+        let qwen_kvs = [
+            ("qwen2.block_count", GgufValue::Uint32(28)),
+            ("qwen2.embedding_length", GgufValue::Uint32(3584)),
+            ("qwen2.feed_forward_length", GgufValue::Uint32(18944)),
+            ("qwen2.attention.head_count", GgufValue::Uint32(28)),
+            ("qwen2.attention.head_count_kv", GgufValue::Uint32(4)),
+            ("qwen2.rope.freq_base", GgufValue::Float32(1_000_000.0)),
+            ("qwen2.rope.dimension_count", GgufValue::Uint32(128)),
+            (
+                "qwen2.attention.layer_norm_rms_epsilon",
+                GgufValue::Float32(1e-6),
+            ),
+            (
+                "tokenizer.ggml.tokens",
+                GgufValue::Array(GgufArray::String(qwen_tokens)),
+            ),
+        ];
+        let qwen_bytes = create_synthetic_gguf_v3_with_kvs(
+            "qwen2",
+            28,
+            &qwen_kvs,
+            &[("blk.0.attn_q.weight", QuantType::Q5_0, &[128, 64])],
+        );
+        let qwen = GgufFile::parse(&qwen_bytes).expect("parse qwen2 gguf");
+        let qm = qwen.metadata();
+        assert_eq!(qm.feed_forward_length(), Some(18944));
+        assert_eq!(qm.rope_freq_base(), Some(1_000_000.0));
+        assert_eq!(qm.rope_dimension_count(), Some(128));
+        assert_eq!(qm.rms_norm_eps(), Some(1e-6));
+        assert_eq!(qm.vocab_size(), Some(5));
+
+        // 3. Phi3 with partial rotary dimension_count and RMS eps
+        let phi3_kvs = [
+            ("phi3.block_count", GgufValue::Uint32(32)),
+            ("phi3.embedding_length", GgufValue::Uint32(3072)),
+            ("phi3.feed_forward_length", GgufValue::Uint32(8192)),
+            ("phi3.attention.head_count", GgufValue::Uint32(32)),
+            ("phi3.attention.head_count_kv", GgufValue::Uint32(32)),
+            ("phi3.rope.freq_base", GgufValue::Float32(10_000.0)),
+            ("phi3.rope.dimension_count", GgufValue::Uint32(96)),
+            (
+                "phi3.attention.layer_norm_rms_epsilon",
+                GgufValue::Float32(1e-5),
+            ),
+            ("phi3.vocab_size", GgufValue::Uint32(32_064)),
+        ];
+        let phi3_bytes = create_synthetic_gguf_v3_with_kvs(
+            "phi3",
+            32,
+            &phi3_kvs,
+            &[("blk.0.ffn_gate_up.weight", QuantType::Q3_K, &[256, 32])],
+        );
+        let phi3 = GgufFile::parse(&phi3_bytes).expect("parse phi3 gguf");
+        let pm = phi3.metadata();
+        assert_eq!(pm.feed_forward_length(), Some(8192));
+        assert_eq!(pm.rope_dimension_count(), Some(96));
+        assert_eq!(pm.vocab_size(), Some(32_064));
+
+        // 4. Mistral with sliding_window
+        let mistral_kvs = [
+            ("mistral.block_count", GgufValue::Uint32(32)),
+            ("mistral.embedding_length", GgufValue::Uint32(4096)),
+            ("mistral.feed_forward_length", GgufValue::Uint32(14336)),
+            ("mistral.attention.head_count", GgufValue::Uint32(32)),
+            ("mistral.attention.head_count_kv", GgufValue::Uint32(8)),
+            ("mistral.attention.sliding_window", GgufValue::Uint32(4096)),
+            ("mistral.rope.freq_base", GgufValue::Float32(10_000.0)),
+            (
+                "mistral.attention.layer_norm_rms_epsilon",
+                GgufValue::Float32(1e-5),
+            ),
+        ];
+        let mistral_bytes = create_synthetic_gguf_v3_with_kvs(
+            "mistral",
+            32,
+            &mistral_kvs,
+            &[("blk.0.attn_q.weight", QuantType::IQ4_NL, &[32, 64])],
+        );
+        let mistral = GgufFile::parse(&mistral_bytes).expect("parse mistral gguf");
+        let mm = mistral.metadata();
+        assert_eq!(mm.sliding_window(), Some(4096));
+        assert_eq!(mm.feed_forward_length(), Some(14336));
+        assert_eq!(mm.rope_freq_base(), Some(10_000.0));
+        assert_eq!(mm.rms_norm_eps(), Some(1e-5));
+        assert_eq!(mm.vocab_size(), Some(16));
+        assert_eq!(mm.attn_logit_softcapping(), None);
+        assert_eq!(mm.final_logit_softcapping(), None);
+
+        // 4b. When both {arch}.vocab_size and non-empty tokenizer.ggml.tokens are absent, vocab_size() is None
+        let empty_tokens_kvs = [(
+            "tokenizer.ggml.tokens",
+            GgufValue::Array(GgufArray::String(Vec::new())),
+        )];
+        let no_vocab_bytes =
+            create_synthetic_gguf_v3_with_kvs("mistral", 32, &empty_tokens_kvs, &[]);
+        let no_vocab = GgufFile::parse(&no_vocab_bytes).expect("parse mistral without vocab");
+        assert_eq!(no_vocab.metadata().vocab_size(), None);
+
+        // 5. Gemma2 with softcapping, explicit key/value length, and sliding window + mixed I2_S/MXFP4
+        let gemma2_kvs = [
+            ("gemma2.block_count", GgufValue::Uint32(42)),
+            ("gemma2.embedding_length", GgufValue::Uint32(3584)),
+            ("gemma2.feed_forward_length", GgufValue::Uint32(14336)),
+            ("gemma2.attention.head_count", GgufValue::Uint32(16)),
+            ("gemma2.attention.head_count_kv", GgufValue::Uint32(8)),
+            ("gemma2.attention.key_length", GgufValue::Uint32(256)),
+            ("gemma2.attention.value_length", GgufValue::Uint32(256)),
+            ("gemma2.attention.sliding_window", GgufValue::Uint32(4096)),
+            ("gemma2.attn_logit_softcapping", GgufValue::Float32(50.0)),
+            ("gemma2.final_logit_softcapping", GgufValue::Float32(30.0)),
+            ("gemma2.rope.freq_base", GgufValue::Float32(10_000.0)),
+            ("gemma2.rope.dimension_count", GgufValue::Uint32(256)),
+            (
+                "gemma2.attention.layer_norm_rms_epsilon",
+                GgufValue::Float32(1e-6),
+            ),
+            ("gemma2.vocab_size", GgufValue::Uint32(256_000)),
+        ];
+        let gemma2_bytes = create_synthetic_gguf_v3_with_kvs(
+            "gemma2",
+            42,
+            &gemma2_kvs,
+            &[
+                ("blk.0.attn_q.weight", QuantType::I2_S, &[128, 32]),
+                ("blk.0.attn_k.weight", QuantType::MXFP4, &[32, 32]),
+            ],
+        );
+        let gemma2 = GgufFile::parse(&gemma2_bytes).expect("parse gemma2 gguf");
+        let gm = gemma2.metadata();
+        assert_eq!(gm.feed_forward_length(), Some(14336));
+        assert_eq!(gm.key_length(), Some(256));
+        assert_eq!(gm.value_length(), Some(256));
+        assert_eq!(gm.sliding_window(), Some(4096));
+        assert_eq!(gm.attn_logit_softcapping(), Some(50.0));
+        assert_eq!(gm.final_logit_softcapping(), Some(30.0));
+        assert_eq!(gm.rope_freq_base(), Some(10_000.0));
+        assert_eq!(gm.rope_dimension_count(), Some(256));
+        assert_eq!(gm.rms_norm_eps(), Some(1e-6));
+        assert_eq!(gm.vocab_size(), Some(256_000));
+        assert_eq!(gm.tensors()[0].quant(), QuantType::I2_S);
+        assert_eq!(gm.tensors()[0].byte_len(), 128 * 32 / 128 * 32 + 32);
+        assert_eq!(gm.tensors()[1].quant(), QuantType::MXFP4);
+        assert_eq!(gm.tensors()[1].byte_len(), 32 * 32 / 32 * 17);
     }
 }
