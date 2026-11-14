@@ -170,6 +170,12 @@ impl<'a> KvCacheView<'a> {
         self.geometry
     }
 
+    /// Returns the maximum sequence token capacity (`seq_capacity`) of this KV cache view.
+    #[must_use]
+    pub const fn seq_capacity(&self) -> usize {
+        self.geometry.seq_capacity
+    }
+
     /// Returns the per-position vector width `n_heads_kv * head_dim`.
     #[must_use]
     pub const fn kv_dim(&self) -> usize {
@@ -299,6 +305,7 @@ pub struct ExecutionContext<'a> {
     jump_forward_tokens: Option<&'a [u32]>,
     position: usize,
     n_ctx: usize,
+    compute_logits: bool,
     logits: &'a mut [f32],
     kv_cache: &'a mut [f32],
     kv_geometry: Option<KvGeometry>,
@@ -328,18 +335,102 @@ impl<'a> ExecutionContext<'a> {
             jump_forward_tokens: None,
             position: 0,
             n_ctx,
+            compute_logits: true,
             logits,
             kv_cache,
             kv_geometry: None,
         })
     }
 
+    /// Creates a zero-offset single-prompt prefill [`ExecutionContext`] expecting output logits,
+    /// delegating to [`Self::new_prefill_chunk`] with `start_position = 0` and
+    /// `compute_logits = true`.
+    ///
+    /// # Errors
+    /// Returns [`K3Error::TensorBoundsError`] if `prompt_tokens` or `logits` is empty, or
+    /// [`K3Error::ContextLengthExceeded`] if `n_ctx == 0` or `prompt_tokens.len() > n_ctx`.
+    pub fn new_prefill(
+        prompt_tokens: &'a [u32],
+        n_ctx: usize,
+        logits: &'a mut [f32],
+        kv_cache: &'a mut [f32],
+    ) -> Result<Self, K3Error> {
+        Self::new_prefill_chunk(prompt_tokens, n_ctx, 0, true, logits, kv_cache)
+    }
+
+    /// Creates a bounded prefill chunk [`ExecutionContext`] over `[start_position..end_position]`
+    /// aligned with [`crate::ipc::TokenInputSlotHeader::start_position`].
+    ///
+    /// Intermediate chunks may set `compute_logits = false` (allowing empty `logits`) so recipes
+    /// skip the vocabulary LM-head projection until the final prompt chunk.
+    ///
+    /// # Errors
+    /// Returns [`K3Error::TensorBoundsError`] if `prompt_tokens` is empty or if
+    /// `compute_logits == true` with an empty `logits` buffer, and returns
+    /// [`K3Error::ContextLengthExceeded`] if `n_ctx == 0`, `start_position + prompt_tokens.len()`
+    /// overflows `usize`, or the chunk end position exceeds `n_ctx`.
+    pub fn new_prefill_chunk(
+        prompt_tokens: &'a [u32],
+        n_ctx: usize,
+        start_position: usize,
+        compute_logits: bool,
+        logits: &'a mut [f32],
+        kv_cache: &'a mut [f32],
+    ) -> Result<Self, K3Error> {
+        if n_ctx == 0 {
+            return Err(K3Error::ContextLengthExceeded {
+                requested_tokens: prompt_tokens.len(),
+                max_context_tokens: 0,
+            });
+        }
+        if prompt_tokens.is_empty() {
+            return Err(K3Error::TensorBoundsError {
+                tensor_name: "prompt_tokens".to_owned(),
+                offset: start_position,
+                byte_len: 0,
+                buffer_len: 0,
+                reason: "prefill chunk requires at least one token".to_owned(),
+            });
+        }
+        let end_pos = validate_context_range(start_position, prompt_tokens.len(), n_ctx)?;
+        if compute_logits && logits.is_empty() {
+            return Err(K3Error::TensorBoundsError {
+                tensor_name: "logits".to_owned(),
+                offset: end_pos,
+                byte_len: size_of::<f32>(),
+                buffer_len: 0,
+                reason: "logits buffer must be non-empty when compute_logits is enabled".to_owned(),
+            });
+        }
+
+        Ok(Self {
+            prompt_tokens,
+            decode_token: None,
+            jump_forward_tokens: None,
+            position: start_position,
+            n_ctx,
+            compute_logits,
+            logits,
+            kv_cache,
+            kv_geometry: None,
+        })
+    }
+
+    const fn effective_context_limit(&self) -> usize {
+        match self.kv_geometry {
+            Some(geom) if geom.seq_capacity < self.n_ctx => geom.seq_capacity,
+            _ => self.n_ctx,
+        }
+    }
+
     /// Attaches a canonical [`KvGeometry`] layout descriptor and verifies the backing `kv_cache`
-    /// buffer is large enough to hold `[num_layers][K|V][seq_capacity][n_heads_kv * head_dim]`.
+    /// buffer is large enough to hold `[num_layers][K|V][seq_capacity][n_heads_kv * head_dim]`
+    /// and that the active chunk end position fits within `kv_geometry.seq_capacity`.
     ///
     /// # Errors
     /// Returns [`K3Error::TensorBoundsError`] if `kv_geometry` has zero/overflowing dimensions or
-    /// if `self.kv_cache().len()` is smaller than `kv_geometry.required_f32_len()`.
+    /// if `self.kv_cache().len()` is smaller than `kv_geometry.required_f32_len()`, or
+    /// [`K3Error::ContextLengthExceeded`] if `self.end_position() > kv_geometry.seq_capacity`.
     pub fn with_kv_geometry(mut self, kv_geometry: KvGeometry) -> Result<Self, K3Error> {
         let required = kv_geometry.required_f32_len()?;
         if self.kv_cache.len() < required {
@@ -355,6 +446,11 @@ impl<'a> ExecutionContext<'a> {
                 ),
             });
         }
+        validate_context_range(
+            self.position,
+            self.prompt_tokens.len(),
+            kv_geometry.seq_capacity,
+        )?;
         self.kv_geometry = Some(kv_geometry);
         Ok(self)
     }
@@ -362,28 +458,28 @@ impl<'a> ExecutionContext<'a> {
     /// Sets the starting KV sequence position cursor for this [`ExecutionContext`].
     ///
     /// # Errors
-    /// Returns [`K3Error::ContextLengthExceeded`] if `position + self.prompt_tokens.len() > self.n_ctx`.
+    /// Returns [`K3Error::ContextLengthExceeded`] if `position + self.prompt_tokens.len()` exceeds
+    /// `self.n_ctx` or attached `KvGeometry::seq_capacity`.
     pub fn with_position(mut self, position: usize) -> Result<Self, K3Error> {
-        let end_pos = position.checked_add(self.prompt_tokens.len()).ok_or(
-            K3Error::ContextLengthExceeded {
-                requested_tokens: usize::MAX,
-                max_context_tokens: self.n_ctx,
-            },
+        validate_context_range(
+            position,
+            self.prompt_tokens.len(),
+            self.effective_context_limit(),
         )?;
-        if end_pos > self.n_ctx {
-            return Err(K3Error::ContextLengthExceeded {
-                requested_tokens: end_pos,
-                max_context_tokens: self.n_ctx,
-            });
-        }
         self.position = position;
         Ok(self)
     }
 
-    /// Returns the input prompt token sequence for the single active evaluation slot.
+    /// Returns the input prompt (or chunk) token sequence for the single active evaluation slot.
     #[must_use]
     pub const fn prompt_tokens(&self) -> &'a [u32] {
         self.prompt_tokens
+    }
+
+    /// Returns the number of tokens in the active prompt or chunk (`self.prompt_tokens().len()`).
+    #[must_use]
+    pub const fn batch_len(&self) -> usize {
+        self.prompt_tokens.len()
     }
 
     /// Returns the current token ID scheduled for the next single-token [`ArchRecipe::decode_step`].
@@ -392,10 +488,44 @@ impl<'a> ExecutionContext<'a> {
         self.decode_token
     }
 
-    /// Returns the current KV sequence position cursor.
+    /// Returns the current KV sequence position cursor (`start_position` at prefill chunk entry).
     #[must_use]
     pub const fn position(&self) -> usize {
         self.position
+    }
+
+    /// Returns the starting KV sequence position cursor for the current prefill chunk
+    /// (alias for [`Self::position`]).
+    #[must_use]
+    pub const fn start_position(&self) -> usize {
+        self.position
+    }
+
+    /// Returns the exclusive ending KV sequence position for the current chunk
+    /// (`start_position + prompt_tokens.len()`).
+    #[must_use]
+    pub const fn end_position(&self) -> usize {
+        self.position.saturating_add(self.prompt_tokens.len())
+    }
+
+    /// Returns the exclusive ending KV sequence position for the current chunk
+    /// (alias for [`Self::end_position`]).
+    #[must_use]
+    pub const fn batch_end_position(&self) -> usize {
+        self.end_position()
+    }
+
+    /// Returns `true` when the active step must materialize final vocabulary logits into `logits`.
+    #[must_use]
+    pub const fn compute_logits(&self) -> bool {
+        self.compute_logits
+    }
+
+    /// Returns `true` when the active step must materialize final vocabulary logits into `logits`
+    /// (alias for [`Self::compute_logits`]).
+    #[must_use]
+    pub const fn needs_logits(&self) -> bool {
+        self.compute_logits
     }
 
     /// Returns the fixed maximum context length (`n_ctx`) for this execution slot.
@@ -461,16 +591,12 @@ impl<'a> ExecutionContext<'a> {
     /// Stages the next generated token for a single-token decode pass, verifying `position < n_ctx`.
     ///
     /// # Errors
-    /// Returns [`K3Error::ContextLengthExceeded`] if `self.position + 1 > self.n_ctx`.
+    /// Returns [`K3Error::ContextLengthExceeded`] if `self.position + 1` exceeds `self.n_ctx` or
+    /// attached `KvGeometry::seq_capacity`.
     pub fn prepare_decode(&mut self, token_id: u32) -> Result<(), K3Error> {
-        let next_pos = self.position.saturating_add(1);
-        if next_pos > self.n_ctx {
-            return Err(K3Error::ContextLengthExceeded {
-                requested_tokens: next_pos,
-                max_context_tokens: self.n_ctx,
-            });
-        }
+        validate_context_range(self.position, 1, self.effective_context_limit())?;
         self.jump_forward_tokens = None;
+        self.compute_logits = true;
         self.decode_token = Some(token_id);
         Ok(())
     }
@@ -478,20 +604,14 @@ impl<'a> ExecutionContext<'a> {
     /// Stages a deterministic `forced_tokens` slice for an atomic jump-forward prefill burst.
     ///
     /// # Errors
-    /// Returns [`K3Error::ContextLengthExceeded`] if `self.position + forced_tokens.len() > self.n_ctx`.
+    /// Returns [`K3Error::ContextLengthExceeded`] if `self.position + forced_tokens.len()` exceeds
+    /// `self.n_ctx` or attached `KvGeometry::seq_capacity`.
     pub fn prepare_jump_forward(&mut self, forced_tokens: &'a [u32]) -> Result<(), K3Error> {
-        let next_pos = self.position.checked_add(forced_tokens.len()).ok_or(
-            K3Error::ContextLengthExceeded {
-                requested_tokens: usize::MAX,
-                max_context_tokens: self.n_ctx,
-            },
+        validate_context_range(
+            self.position,
+            forced_tokens.len(),
+            self.effective_context_limit(),
         )?;
-        if next_pos > self.n_ctx {
-            return Err(K3Error::ContextLengthExceeded {
-                requested_tokens: next_pos,
-                max_context_tokens: self.n_ctx,
-            });
-        }
         self.decode_token = None;
         self.jump_forward_tokens = Some(forced_tokens);
         Ok(())
@@ -505,24 +625,34 @@ impl<'a> ExecutionContext<'a> {
     /// Advances the KV sequence position cursor by `token_count` tokens after a forward step.
     ///
     /// # Errors
-    /// Returns [`K3Error::ContextLengthExceeded`] if `self.position + token_count > self.n_ctx`.
+    /// Returns [`K3Error::ContextLengthExceeded`] if `self.position + token_count` exceeds
+    /// `self.n_ctx` or attached `KvGeometry::seq_capacity`.
     pub fn advance_position(&mut self, token_count: usize) -> Result<usize, K3Error> {
         let new_pos =
-            self.position
-                .checked_add(token_count)
-                .ok_or(K3Error::ContextLengthExceeded {
-                    requested_tokens: usize::MAX,
-                    max_context_tokens: self.n_ctx,
-                })?;
-        if new_pos > self.n_ctx {
-            return Err(K3Error::ContextLengthExceeded {
-                requested_tokens: new_pos,
-                max_context_tokens: self.n_ctx,
-            });
-        }
+            validate_context_range(self.position, token_count, self.effective_context_limit())?;
         self.position = new_pos;
         Ok(self.position)
     }
+}
+
+const fn validate_context_range(
+    start_position: usize,
+    token_count: usize,
+    limit: usize,
+) -> Result<usize, K3Error> {
+    let Some(end_pos) = start_position.checked_add(token_count) else {
+        return Err(K3Error::ContextLengthExceeded {
+            requested_tokens: usize::MAX,
+            max_context_tokens: limit,
+        });
+    };
+    if end_pos > limit {
+        return Err(K3Error::ContextLengthExceeded {
+            requested_tokens: end_pos,
+            max_context_tokens: limit,
+        });
+    }
+    Ok(end_pos)
 }
 
 /// Architecture recipe trait compiled in-process per ADR-023 and ADR-024.
@@ -609,8 +739,13 @@ pub trait ArchRecipe: Send + Sync + core::fmt::Debug {
         self.prefill_step(ctx, weights)
     }
 
-    /// Executes the prompt prefill forward pass over [`ExecutionContext::prompt_tokens`]
-    /// for a single prompt (ADR-005), populating the KV cache and writing next-token logits.
+    /// Executes the prompt or bounded chunk prefill forward pass over
+    /// [`ExecutionContext::prompt_tokens`] starting at [`ExecutionContext::start_position`] for a
+    /// single prompt (ADR-005).
+    ///
+    /// Populates KV cache positions `[start_position..end_position)` and writes next-token logits
+    /// when [`ExecutionContext::compute_logits`] (`needs_logits`) is `true` (skipping LM-head
+    /// projection on intermediate prefill chunks where `compute_logits` is `false`).
     ///
     /// # Errors
     /// Returns [`K3Error`] if a required tensor is missing, has an unsupported quantization
@@ -637,6 +772,7 @@ pub trait ArchRecipe: Send + Sync + core::fmt::Debug {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::TokenInputSlotHeader;
     use crate::gguf::{GgufFile, GgufValue, test_helpers::create_synthetic_gguf_v3_with_kvs};
     use crate::tensor::TensorView;
 
@@ -836,5 +972,449 @@ mod tests {
             short_ctx.with_kv_geometry(geom),
             Err(K3Error::TensorBoundsError { .. })
         ));
+    }
+
+    #[derive(Debug)]
+    struct ReferenceCausalRecipe {
+        vocab_size: usize,
+    }
+
+    impl ReferenceCausalRecipe {
+        #[allow(clippy::cast_precision_loss)]
+        fn causal_layer_step(
+            kv_view: &mut KvCacheView<'_>,
+            layer: usize,
+            tokens: &[u32],
+            start_pos: usize,
+            kv_dim: usize,
+            hidden: &[f32],
+        ) -> Result<Vec<f32>, K3Error> {
+            let mut next_hidden = vec![0.0_f32; hidden.len()];
+            for (offset, &tok) in tokens.iter().enumerate() {
+                let pos = start_pos + offset;
+                let h_slice = &hidden[offset * kv_dim..(offset + 1) * kv_dim];
+                let k_vals: Vec<f32> = h_slice
+                    .iter()
+                    .enumerate()
+                    .map(|(d, &v)| v * 0.5 + (layer as f32) * 0.125 + (d as f32) * 0.0625)
+                    .collect();
+                let v_vals: Vec<f32> = h_slice
+                    .iter()
+                    .enumerate()
+                    .map(|(d, &v)| v * 0.25 + ((tok % 7) as f32) * 0.0625 - (d as f32) * 0.031_25)
+                    .collect();
+                {
+                    let (k_dst, v_dst) = kv_view.write_pos_range(layer, pos)?;
+                    k_dst.copy_from_slice(&k_vals);
+                    v_dst.copy_from_slice(&v_vals);
+                }
+
+                let (k_valid, v_valid) = kv_view.valid_kv_range(layer, pos + 1)?;
+                let mut attn_acc = vec![0.0_f32; kv_dim];
+                let mut weight_sum = 0.0_f32;
+                for (k_past, v_past) in k_valid
+                    .chunks_exact(kv_dim)
+                    .zip(v_valid.chunks_exact(kv_dim))
+                {
+                    let mut dot = 0.0_f32;
+                    for d in 0..kv_dim {
+                        dot += k_vals[d] * k_past[d];
+                    }
+                    let score = if dot >= 0.0 {
+                        1.0_f32 + dot
+                    } else {
+                        1.0_f32 / (1.0_f32 - dot)
+                    };
+                    weight_sum += score;
+                    for d in 0..kv_dim {
+                        attn_acc[d] += score * v_past[d];
+                    }
+                }
+                let inv = 1.0_f32 / weight_sum.max(1.0e-6);
+                let out_slice = &mut next_hidden[offset * kv_dim..(offset + 1) * kv_dim];
+                for d in 0..kv_dim {
+                    out_slice[d] = h_slice[d] + attn_acc[d] * inv;
+                }
+            }
+            Ok(next_hidden)
+        }
+
+        #[allow(clippy::cast_precision_loss)]
+        fn run_tokens(
+            &self,
+            ctx: &mut ExecutionContext<'_>,
+            tokens: &[u32],
+            start_pos: usize,
+            write_logits: bool,
+        ) -> Result<(), K3Error> {
+            let geom = ctx
+                .kv_geometry()
+                .ok_or_else(|| K3Error::TensorBoundsError {
+                    tensor_name: "kv_cache".to_owned(),
+                    offset: 0,
+                    byte_len: 0,
+                    buffer_len: 0,
+                    reason: "ReferenceCausalRecipe requires KvGeometry".to_owned(),
+                })?;
+            let kv_dim = geom.kv_dim()?;
+            let mut hidden = vec![0.0_f32; tokens.len() * kv_dim];
+            for (offset, &tok) in tokens.iter().enumerate() {
+                let pos = start_pos + offset;
+                for d in 0..kv_dim {
+                    hidden[offset * kv_dim + d] = ((tok as f32) * 0.031_25)
+                        + ((pos as f32) * 0.007_812_5)
+                        + ((d as f32) * 0.015_625);
+                }
+            }
+
+            {
+                let mut kv_view = ctx
+                    .kv_view_mut()
+                    .ok_or_else(|| K3Error::TensorBoundsError {
+                        tensor_name: "kv_cache".to_owned(),
+                        offset: 0,
+                        byte_len: 0,
+                        buffer_len: 0,
+                        reason: "ReferenceCausalRecipe requires valid KvCacheView".to_owned(),
+                    })?;
+                for layer in 0..geom.num_layers {
+                    hidden = Self::causal_layer_step(
+                        &mut kv_view,
+                        layer,
+                        tokens,
+                        start_pos,
+                        kv_dim,
+                        &hidden,
+                    )?;
+                }
+            }
+
+            if write_logits {
+                let last_offset = tokens.len() - 1;
+                let last_h = &hidden[last_offset * kv_dim..(last_offset + 1) * kv_dim];
+                let logits = ctx.logits_mut();
+                if logits.len() < self.vocab_size {
+                    return Err(K3Error::TensorBoundsError {
+                        tensor_name: "logits".to_owned(),
+                        offset: 0,
+                        byte_len: self.vocab_size * size_of::<f32>(),
+                        buffer_len: size_of_val(logits),
+                        reason: "logits slice smaller than vocab_size".to_owned(),
+                    });
+                }
+                for (v, slot) in logits.iter_mut().take(self.vocab_size).enumerate() {
+                    let mut sum = 0.0_f32;
+                    for (d, &hv) in last_h.iter().enumerate() {
+                        sum += hv * (((v as f32) + 1.0) * 0.031_25 - (d as f32) * 0.015_625);
+                    }
+                    *slot = sum;
+                }
+            }
+
+            ctx.advance_position(tokens.len())?;
+            Ok(())
+        }
+    }
+
+    impl ArchRecipe for ReferenceCausalRecipe {
+        fn architecture_id(&self) -> &'static str {
+            "reference-causal"
+        }
+
+        fn supports_quant(&self, quant: QuantType) -> bool {
+            matches!(quant, QuantType::F32)
+        }
+
+        fn prefill_step(
+            &self,
+            ctx: &mut ExecutionContext<'_>,
+            _weights: &dyn ModelWeights,
+        ) -> Result<(), K3Error> {
+            let tokens = ctx.prompt_tokens().to_vec();
+            let start_pos = ctx.start_position();
+            let write_logits = ctx.compute_logits();
+            self.run_tokens(ctx, &tokens, start_pos, write_logits)
+        }
+
+        fn decode_step(
+            &self,
+            ctx: &mut ExecutionContext<'_>,
+            _weights: &dyn ModelWeights,
+        ) -> Result<(), K3Error> {
+            let token = ctx
+                .decode_token()
+                .ok_or_else(|| K3Error::TensorBoundsError {
+                    tensor_name: "decode_token".to_owned(),
+                    offset: 0,
+                    byte_len: 0,
+                    buffer_len: 0,
+                    reason: "decode_step called without staged decode_token".to_owned(),
+                })?;
+            let pos = ctx.position();
+            let write_logits = ctx.compute_logits();
+            self.run_tokens(ctx, &[token], pos, write_logits)
+        }
+    }
+
+    #[test]
+    fn test_wave3_prefill_chunk_validation_and_slot_alignment() {
+        let mut logits = [0.0_f32; 8];
+        let mut kv_buf = [0.0_f32; 256];
+
+        // new_prefill defaults to start_position=0, compute_logits=true
+        let ctx = ExecutionContext::new_prefill(&[10, 20, 30], 16, &mut logits, &mut kv_buf)
+            .expect("new_prefill should succeed");
+        assert_eq!(ctx.start_position(), 0);
+        assert_eq!(ctx.batch_len(), 3);
+        assert_eq!(ctx.end_position(), 3);
+        assert_eq!(ctx.batch_end_position(), 3);
+        assert!(ctx.compute_logits());
+        assert!(ctx.needs_logits());
+
+        // Intermediate chunk with compute_logits=false permits empty &mut [] logits slice
+        let mut empty_logits: [f32; 0] = [];
+        let slot_hdr = TokenInputSlotHeader {
+            slot_seq_id: 9,
+            token_len: 3,
+            start_position: 4,
+        };
+        let chunk_ctx = ExecutionContext::new_prefill_chunk(
+            &[1, 2, 3],
+            16,
+            slot_hdr.start_position as usize,
+            false,
+            &mut empty_logits,
+            &mut kv_buf,
+        )
+        .expect("intermediate chunk without logits should succeed");
+        assert_eq!(chunk_ctx.start_position(), 4);
+        assert_eq!(chunk_ctx.batch_len(), 3);
+        assert_eq!(chunk_ctx.end_position(), 7);
+        assert!(!chunk_ctx.compute_logits());
+        assert!(!chunk_ctx.needs_logits());
+
+        // compute_logits=true rejects empty logits
+        assert!(matches!(
+            ExecutionContext::new_prefill_chunk(
+                &[1, 2],
+                16,
+                0,
+                true,
+                &mut empty_logits,
+                &mut kv_buf
+            ),
+            Err(K3Error::TensorBoundsError { .. })
+        ));
+
+        // Empty prompt fails closed
+        assert!(matches!(
+            ExecutionContext::new_prefill_chunk(&[], 16, 0, false, &mut empty_logits, &mut kv_buf),
+            Err(K3Error::TensorBoundsError { .. })
+        ));
+
+        // Zero n_ctx, overflow, and end_position > n_ctx fail closed
+        assert!(matches!(
+            ExecutionContext::new_prefill_chunk(&[1], 0, 0, true, &mut logits, &mut kv_buf),
+            Err(K3Error::ContextLengthExceeded { .. })
+        ));
+        assert!(matches!(
+            ExecutionContext::new_prefill_chunk(
+                &[1, 2],
+                16,
+                usize::MAX - 1,
+                false,
+                &mut empty_logits,
+                &mut kv_buf
+            ),
+            Err(K3Error::ContextLengthExceeded { .. })
+        ));
+        assert!(matches!(
+            ExecutionContext::new_prefill_chunk(&[1, 2, 3], 8, 6, true, &mut logits, &mut kv_buf),
+            Err(K3Error::ContextLengthExceeded { .. })
+        ));
+
+        // KvGeometry capacity shorter than end_position fails closed in with_kv_geometry
+        let small_geom = KvGeometry::new(2, 2, 4, 6, None).expect("geometry");
+        let over_cap =
+            ExecutionContext::new_prefill_chunk(&[1, 2, 3], 16, 4, true, &mut logits, &mut kv_buf)
+                .expect("context fits n_ctx=16");
+        assert!(matches!(
+            over_cap.with_kv_geometry(small_geom),
+            Err(K3Error::ContextLengthExceeded { .. })
+        ));
+    }
+
+    fn execute_chunked_prefill(
+        recipe: &ReferenceCausalRecipe,
+        prompt: &[u32],
+        n_ctx: usize,
+        geom: KvGeometry,
+        u_batch: usize,
+        final_logits: &mut [f32],
+        kv_buf: &mut [f32],
+    ) {
+        let mut sentinel_logits = [-999.0_f32; 8];
+        for (idx, chunk) in prompt.chunks(u_batch).enumerate() {
+            let start_pos = idx * u_batch;
+            let is_last = start_pos + chunk.len() == prompt.len();
+            if is_last {
+                let mut ctx = ExecutionContext::new_prefill_chunk(
+                    chunk,
+                    n_ctx,
+                    start_pos,
+                    true,
+                    final_logits,
+                    kv_buf,
+                )
+                .expect("final chunk context")
+                .with_kv_geometry(geom)
+                .expect("final chunk geometry");
+                recipe
+                    .prefill_step(&mut ctx, &EmptyMockWeights)
+                    .expect("final prefill step");
+                assert_eq!(ctx.position(), prompt.len());
+            } else {
+                let mut ctx = ExecutionContext::new_prefill_chunk(
+                    chunk,
+                    n_ctx,
+                    start_pos,
+                    false,
+                    &mut sentinel_logits,
+                    kv_buf,
+                )
+                .expect("intermediate chunk context")
+                .with_kv_geometry(geom)
+                .expect("intermediate chunk geometry");
+                recipe
+                    .prefill_step(&mut ctx, &EmptyMockWeights)
+                    .expect("intermediate prefill step");
+                assert_eq!(ctx.position(), start_pos + chunk.len());
+                assert!(
+                    sentinel_logits
+                        .iter()
+                        .all(|v| v.to_bits() == (-999.0_f32).to_bits()),
+                    "intermediate chunk with compute_logits=false must not write logits"
+                );
+            }
+        }
+    }
+
+    fn assert_bit_identical(actual: &[f32], expected: &[f32], label: &str) {
+        assert_eq!(actual.len(), expected.len(), "{label}: length mismatch");
+        for (idx, (&a, &e)) in actual.iter().zip(expected.iter()).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                e.to_bits(),
+                "{label}: float mismatch at index {idx} ({a} != {e})"
+            );
+        }
+    }
+
+    #[test]
+    fn test_wave3_chunked_prefill_equivalence_and_sliding_window() {
+        let prompt = [11_u32, 22, 33, 44, 55, 66, 77, 88, 99, 101];
+        let n_ctx = 16;
+        let vocab_size = 8;
+        let recipe = ReferenceCausalRecipe { vocab_size };
+
+        for sliding_window in [None, Some(6)] {
+            let geom = KvGeometry::new(2, 2, 4, n_ctx, sliding_window).expect("valid KvGeometry");
+            let buf_len = geom.required_f32_len().expect("kv buffer length");
+
+            let mut ref_kv = vec![12345.0_f32; buf_len];
+            let mut ref_logits = vec![0.0_f32; vocab_size];
+            let mut ref_ctx =
+                ExecutionContext::new_prefill(&prompt, n_ctx, &mut ref_logits, &mut ref_kv)
+                    .expect("reference prefill context")
+                    .with_kv_geometry(geom)
+                    .expect("reference geometry");
+            recipe
+                .prefill_step(&mut ref_ctx, &EmptyMockWeights)
+                .expect("reference prefill");
+            assert_eq!(ref_ctx.position(), prompt.len());
+
+            for u_batch in [1_usize, 3, 10, 16] {
+                let mut kv = vec![12345.0_f32; buf_len];
+                let mut logits = vec![0.0_f32; vocab_size];
+                execute_chunked_prefill(
+                    &recipe,
+                    &prompt,
+                    n_ctx,
+                    geom,
+                    u_batch,
+                    &mut logits,
+                    &mut kv,
+                );
+                assert_bit_identical(&kv, &ref_kv, &format!("kv u_batch={u_batch}"));
+                assert_bit_identical(&logits, &ref_logits, &format!("logits u_batch={u_batch}"));
+            }
+        }
+    }
+
+    #[test]
+    fn test_wave3_empty_intermediate_logits_and_decode_continuation() {
+        let prompt = [11_u32, 22, 33, 44, 55, 66, 77, 88, 99, 101];
+        let n_ctx = 16;
+        let vocab_size = 8;
+        let recipe = ReferenceCausalRecipe { vocab_size };
+        let geom = KvGeometry::new(2, 2, 4, n_ctx, Some(6)).expect("valid KvGeometry");
+        let buf_len = geom.required_f32_len().expect("kv buffer length");
+
+        let mut ref_kv = vec![12345.0_f32; buf_len];
+        let mut ref_logits = vec![0.0_f32; vocab_size];
+        let mut ref_ctx =
+            ExecutionContext::new_prefill(&prompt, n_ctx, &mut ref_logits, &mut ref_kv)
+                .expect("reference context")
+                .with_kv_geometry(geom)
+                .expect("reference geometry");
+        recipe
+            .prefill_step(&mut ref_ctx, &EmptyMockWeights)
+            .expect("reference prefill");
+
+        let mut chunk_kv = vec![12345.0_f32; buf_len];
+        let mut chunk_logits = vec![0.0_f32; vocab_size];
+        for (idx, chunk) in prompt.chunks(3).enumerate() {
+            let start_pos = idx * 3;
+            let is_last = start_pos + chunk.len() == prompt.len();
+            let mut empty: [f32; 0] = [];
+            let target_logits: &mut [f32] = if is_last {
+                &mut chunk_logits
+            } else {
+                &mut empty
+            };
+            let mut ctx = ExecutionContext::new_prefill_chunk(
+                chunk,
+                n_ctx,
+                start_pos,
+                is_last,
+                target_logits,
+                &mut chunk_kv,
+            )
+            .expect("chunk ctx")
+            .with_kv_geometry(geom)
+            .expect("chunk geom");
+            recipe
+                .prefill_step(&mut ctx, &EmptyMockWeights)
+                .expect("chunk step");
+            if is_last {
+                ctx.prepare_decode(202).expect("prepare_decode at pos 10");
+                assert_eq!(ctx.position(), prompt.len());
+                assert!(ctx.compute_logits());
+                recipe
+                    .decode_step(&mut ctx, &EmptyMockWeights)
+                    .expect("decode step at pos 10");
+                assert_eq!(ctx.position(), prompt.len() + 1);
+            }
+        }
+
+        ref_ctx
+            .prepare_decode(202)
+            .expect("ref prepare_decode at pos 10");
+        recipe
+            .decode_step(&mut ref_ctx, &EmptyMockWeights)
+            .expect("ref decode step at pos 10");
+
+        assert_bit_identical(&chunk_kv, &ref_kv, "kv after prefill+decode");
+        assert_bit_identical(&chunk_logits, &ref_logits, "logits after prefill+decode");
     }
 }
