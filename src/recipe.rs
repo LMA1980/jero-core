@@ -4,6 +4,8 @@ use core::ops::Range;
 
 use crate::error::K3Error;
 use crate::gguf::ModelMetadata;
+use crate::ipc::KvDtype;
+use crate::scratch::ScratchWorkspace;
 use crate::tensor::{ModelWeights, QuantType};
 
 /// Canonical layout dimensions for a contiguous `[layer][K|V][pos][kv_dim]` KV cache buffer.
@@ -119,6 +121,101 @@ impl KvGeometry {
                 reason: "KvGeometry required_f32_len overflowed usize".to_owned(),
             })
     }
+
+    /// Returns the per-position byte stride of one K or V vector for `dtype`.
+    ///
+    /// # Errors
+    /// Returns [`K3Error::TensorBoundsError`] if dimensions are invalid, `Q8_0` `kv_dim` is not
+    /// block-aligned to `32`, or the stride overflows `usize`.
+    pub fn row_bytes(&self, dtype: KvDtype) -> Result<usize, K3Error> {
+        dtype.row_bytes(self.kv_dim()?)
+    }
+
+    /// Returns the byte span of a single K or V plane (`seq_capacity * row_bytes(dtype)`).
+    ///
+    /// # Errors
+    /// Returns [`K3Error::TensorBoundsError`] if dimensions are invalid or bytes overflow `usize`.
+    pub fn plane_bytes(&self, dtype: KvDtype) -> Result<usize, K3Error> {
+        let kv_dim = self.kv_dim()?;
+        dtype.plane_bytes(self.seq_capacity, kv_dim)
+    }
+
+    /// Returns the total byte footprint across all layers (`num_layers * 2 * plane_bytes(dtype)`).
+    ///
+    /// # Errors
+    /// Returns [`K3Error::TensorBoundsError`] if dimensions are invalid or bytes overflow `usize`.
+    pub fn total_bytes(&self, dtype: KvDtype) -> Result<usize, K3Error> {
+        let kv_dim = self.kv_dim()?;
+        dtype.total_kv_bytes(self.num_layers, self.seq_capacity, kv_dim)
+    }
+
+    /// Returns the exact starting byte offset of sequence position `pos` within `layer` and
+    /// plane (`is_v_plane`) for storage encoding `dtype`.
+    ///
+    /// # Errors
+    /// Returns [`K3Error::TensorBoundsError`] if `layer >= num_layers`, dimensions/stride are
+    /// invalid, or byte arithmetic overflows `usize`, and [`K3Error::ContextLengthExceeded`] if
+    /// `pos >= seq_capacity`.
+    pub fn pos_byte_offset(
+        &self,
+        layer: usize,
+        is_v_plane: bool,
+        pos: usize,
+        dtype: KvDtype,
+    ) -> Result<usize, K3Error> {
+        if pos >= self.seq_capacity {
+            return Err(K3Error::ContextLengthExceeded {
+                requested_tokens: pos.saturating_add(1),
+                max_context_tokens: self.seq_capacity,
+            });
+        }
+        let plane = self.plane_bytes(dtype)?;
+        let total = self.total_bytes(dtype)?;
+        if layer >= self.num_layers {
+            return Err(K3Error::TensorBoundsError {
+                tensor_name: format!("kv_cache.layer.{layer}"),
+                offset: 0,
+                byte_len: plane.saturating_mul(2),
+                buffer_len: total,
+                reason: format!(
+                    "layer index {layer} out of bounds for num_layers={}",
+                    self.num_layers
+                ),
+            });
+        }
+        let row = self.row_bytes(dtype)?;
+        let layer_base = plane
+            .checked_mul(2)
+            .and_then(|span| span.checked_mul(layer))
+            .ok_or_else(|| K3Error::TensorBoundsError {
+                tensor_name: "kv_cache".to_owned(),
+                offset: usize::MAX,
+                byte_len: row,
+                buffer_len: total,
+                reason: "KvGeometry layer_base offset overflowed usize".to_owned(),
+            })?;
+        let plane_base = if is_v_plane {
+            layer_base.checked_add(plane)
+        } else {
+            Some(layer_base)
+        }
+        .ok_or_else(|| K3Error::TensorBoundsError {
+            tensor_name: "kv_cache".to_owned(),
+            offset: usize::MAX,
+            byte_len: row,
+            buffer_len: total,
+            reason: "KvGeometry plane_base offset overflowed usize".to_owned(),
+        })?;
+        pos.checked_mul(row)
+            .and_then(|pos_off| plane_base.checked_add(pos_off))
+            .ok_or_else(|| K3Error::TensorBoundsError {
+                tensor_name: "kv_cache".to_owned(),
+                offset: usize::MAX,
+                byte_len: row,
+                buffer_len: total,
+                reason: "KvGeometry pos_byte_offset overflowed usize".to_owned(),
+            })
+    }
 }
 
 /// Bounds-checked mutable view over a contiguous `[layer][K|V][pos][kv_dim]` KV cache buffer.
@@ -186,6 +283,56 @@ impl<'a> KvCacheView<'a> {
     #[must_use]
     pub const fn plane_len(&self) -> usize {
         self.plane_len
+    }
+
+    /// Returns the storage [`KvDtype`] backing this typed view ([`KvDtype::F32`]).
+    #[must_use]
+    pub const fn kv_dtype(&self) -> KvDtype {
+        KvDtype::F32
+    }
+
+    /// Returns the per-position byte stride of one K or V row under encoding `dtype`.
+    ///
+    /// # Errors
+    /// Returns [`K3Error::TensorBoundsError`] if `dtype == KvDtype::Q8_0` with unaligned `kv_dim`
+    /// or on `usize` overflow.
+    pub fn row_bytes(&self, dtype: KvDtype) -> Result<usize, K3Error> {
+        dtype.row_bytes(self.kv_dim)
+    }
+
+    /// Returns the single-plane (`seq_capacity * row_bytes(dtype)`) byte span for `dtype`.
+    ///
+    /// # Errors
+    /// Returns [`K3Error::TensorBoundsError`] if `row_bytes` fails or the product overflows `usize`.
+    pub fn plane_bytes(&self, dtype: KvDtype) -> Result<usize, K3Error> {
+        dtype.plane_bytes(self.geometry.seq_capacity, self.kv_dim)
+    }
+
+    /// Returns the total byte span across all layers (`num_layers * 2 * plane_bytes(dtype)`).
+    ///
+    /// # Errors
+    /// Returns [`K3Error::TensorBoundsError`] if `plane_bytes` fails or the product overflows `usize`.
+    pub fn total_bytes(&self, dtype: KvDtype) -> Result<usize, K3Error> {
+        dtype.total_kv_bytes(
+            self.geometry.num_layers,
+            self.geometry.seq_capacity,
+            self.kv_dim,
+        )
+    }
+
+    /// Returns the exact byte offset for `(layer, is_v_plane, pos)` under storage encoding `dtype`.
+    ///
+    /// # Errors
+    /// Returns [`K3Error::TensorBoundsError`] on invalid `layer`, unaligned `Q8_0` `kv_dim`, or
+    /// overflow, and [`K3Error::ContextLengthExceeded`] if `pos >= seq_capacity`.
+    pub fn pos_byte_offset(
+        &self,
+        layer: usize,
+        is_v_plane: bool,
+        pos: usize,
+        dtype: KvDtype,
+    ) -> Result<usize, K3Error> {
+        self.geometry.pos_byte_offset(layer, is_v_plane, pos, dtype)
     }
 
     fn layer_offsets(&self, layer: usize) -> Result<(usize, usize, usize), K3Error> {
@@ -309,6 +456,7 @@ pub struct ExecutionContext<'a> {
     logits: &'a mut [f32],
     kv_cache: &'a mut [f32],
     kv_geometry: Option<KvGeometry>,
+    scratch: Option<&'a mut ScratchWorkspace>,
 }
 
 impl<'a> ExecutionContext<'a> {
@@ -339,6 +487,7 @@ impl<'a> ExecutionContext<'a> {
             logits,
             kv_cache,
             kv_geometry: None,
+            scratch: None,
         })
     }
 
@@ -413,6 +562,7 @@ impl<'a> ExecutionContext<'a> {
             logits,
             kv_cache,
             kv_geometry: None,
+            scratch: None,
         })
     }
 
@@ -565,6 +715,53 @@ impl<'a> ExecutionContext<'a> {
     /// Returns simultaneous mutable views of the logits and KV cache buffers.
     pub fn buffers_mut(&mut self) -> (&mut [f32], &mut [f32]) {
         (self.logits, self.kv_cache)
+    }
+
+    /// Attaches a pre-allocated 128-byte aligned [`ScratchWorkspace`] for zero-allocation steps.
+    #[must_use]
+    pub fn with_scratch(mut self, scratch: &'a mut ScratchWorkspace) -> Self {
+        self.scratch = Some(scratch);
+        self
+    }
+
+    /// Returns an immutable reference to the attached [`ScratchWorkspace`], if configured.
+    #[must_use]
+    pub fn scratch(&self) -> Option<&ScratchWorkspace> {
+        self.scratch.as_deref()
+    }
+
+    /// Returns a mutable reference to the attached [`ScratchWorkspace`], if configured.
+    pub fn scratch_mut(&mut self) -> Option<&mut ScratchWorkspace> {
+        self.scratch.as_deref_mut()
+    }
+
+    /// Resets the attached [`ScratchWorkspace`] bump cursor in O(1), if configured.
+    pub fn reset_scratch(&mut self) {
+        if let Some(scratch) = self.scratch.as_deref_mut() {
+            scratch.reset();
+        }
+    }
+
+    /// Returns simultaneous mutable views of logits, KV cache, and optional [`ScratchWorkspace`].
+    pub fn buffers_and_scratch_mut(
+        &mut self,
+    ) -> (&mut [f32], &mut [f32], Option<&mut ScratchWorkspace>) {
+        (self.logits, self.kv_cache, self.scratch.as_deref_mut())
+    }
+
+    /// Returns simultaneous mutable views of logits, optional [`KvCacheView`], and optional
+    /// [`ScratchWorkspace`].
+    pub fn logits_kv_and_scratch_mut(
+        &mut self,
+    ) -> (
+        &mut [f32],
+        Option<KvCacheView<'_>>,
+        Option<&mut ScratchWorkspace>,
+    ) {
+        let kv_view = self
+            .kv_geometry
+            .and_then(|geom| KvCacheView::new(self.kv_cache, geom).ok());
+        (self.logits, kv_view, self.scratch.as_deref_mut())
     }
 
     /// Returns the configured [`KvGeometry`], if attached via [`Self::with_kv_geometry`].
@@ -1416,5 +1613,59 @@ mod tests {
 
         assert_bit_identical(&chunk_kv, &ref_kv, "kv after prefill+decode");
         assert_bit_identical(&chunk_logits, &ref_logits, "logits after prefill+decode");
+    }
+
+    #[test]
+    fn execution_context_plumbs_scratch_workspace_and_kv_dtype_strides() {
+        let geom = KvGeometry::new(2, 2, 16, 8, Some(4)).expect("valid 32-dim kv geometry");
+        assert_eq!(geom.kv_dim().unwrap(), 32);
+        assert_eq!(geom.row_bytes(KvDtype::F32).unwrap(), 128);
+        assert_eq!(geom.row_bytes(KvDtype::F16).unwrap(), 64);
+        assert_eq!(geom.row_bytes(KvDtype::Q8_0).unwrap(), 34);
+        assert_eq!(geom.plane_bytes(KvDtype::Q8_0).unwrap(), 8 * 34);
+        assert_eq!(geom.total_bytes(KvDtype::Q8_0).unwrap(), 2 * 2 * 8 * 34);
+        assert_eq!(
+            geom.pos_byte_offset(1, true, 3, KvDtype::Q8_0).unwrap(),
+            (2 * 8 * 34) + (8 * 34) + (3 * 34)
+        );
+        assert!(geom.pos_byte_offset(2, false, 0, KvDtype::F32).is_err());
+        assert!(geom.pos_byte_offset(0, false, 8, KvDtype::F32).is_err());
+
+        let mut logits = [0.0f32; 8];
+        let mut kv_buf = vec![0.0f32; geom.required_f32_len().expect("f32 len")];
+        let mut scratch = ScratchWorkspace::new(512).expect("scratch workspace");
+
+        {
+            let mut ctx = ExecutionContext::new(&[1, 2], 8, &mut logits, &mut kv_buf)
+                .expect("ctx")
+                .with_kv_geometry(geom)
+                .expect("geom")
+                .with_scratch(&mut scratch);
+
+            let (logits_ref, kv_opt, scratch_opt) = ctx.logits_kv_and_scratch_mut();
+            let kv_view = kv_opt.expect("kv_view");
+            assert_eq!(kv_view.kv_dtype(), KvDtype::F32);
+            assert_eq!(kv_view.row_bytes(KvDtype::Q8_0).unwrap(), 34);
+            assert_eq!(kv_view.plane_bytes(KvDtype::F16).unwrap(), 8 * 64);
+            assert_eq!(kv_view.total_bytes(KvDtype::F32).unwrap(), 2 * 2 * 8 * 128);
+            assert_eq!(
+                kv_view.pos_byte_offset(0, true, 1, KvDtype::F16).unwrap(),
+                8 * 64 + 64
+            );
+
+            let ws = scratch_opt.expect("scratch attached");
+            let q = ws.alloc_f32(16).expect("alloc q");
+            assert_eq!(q.as_ptr() as usize % crate::scratch::SCRATCH_ALIGNMENT, 0);
+            q[0] = 3.5;
+            let s = ws.alloc_i8(32).expect("alloc quant");
+            assert_eq!(s.as_ptr() as usize % crate::scratch::SCRATCH_ALIGNMENT, 0);
+            s[0] = 7;
+            logits_ref[0] = 3.5;
+
+            ctx.reset_scratch();
+            assert_eq!(ctx.scratch().expect("scratch").used_bytes(), 0);
+        }
+
+        assert!(scratch.peak_used_bytes() >= 128 + 32);
     }
 }
