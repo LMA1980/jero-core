@@ -113,6 +113,15 @@ pub const KV_DTYPE_F16: u8 = 1;
 /// KV cache storage dtype: 8-bit block-quantized (`kv_dtype = 2`).
 pub const KV_DTYPE_Q8_0: u8 = 2;
 
+/// Numerical feature tensor storage dtype: 32-bit IEEE float (`feature_dtype = 0`, wire default).
+pub const FEATURE_DTYPE_F32: u8 = 0;
+/// Numerical feature tensor storage dtype: 16-bit IEEE float (`feature_dtype = 1`).
+pub const FEATURE_DTYPE_F16: u8 = 1;
+/// Numerical feature tensor storage dtype: signed 32-bit integer (`feature_dtype = 2`).
+pub const FEATURE_DTYPE_I32: u8 = 2;
+/// Numerical feature tensor storage dtype: signed 8-bit integer (`feature_dtype = 3`).
+pub const FEATURE_DTYPE_I8: u8 = 3;
+
 /// Type ID: 101 — Request to allocate a shared memory arena.
 #[derive(ForyStruct, serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct AllocateArenaRequest {

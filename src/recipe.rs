@@ -457,6 +457,10 @@ pub struct ExecutionContext<'a> {
     kv_cache: &'a mut [f32],
     kv_geometry: Option<KvGeometry>,
     scratch: Option<&'a mut ScratchWorkspace>,
+    feature_input: Option<&'a [f32]>,
+    feature_dims: Option<(usize, usize)>,
+    soft_prompt_embeds: Option<&'a [f32]>,
+    soft_prompt_dims: Option<(usize, usize)>,
 }
 
 impl<'a> ExecutionContext<'a> {
@@ -488,6 +492,10 @@ impl<'a> ExecutionContext<'a> {
             kv_cache,
             kv_geometry: None,
             scratch: None,
+            feature_input: None,
+            feature_dims: None,
+            soft_prompt_embeds: None,
+            soft_prompt_dims: None,
         })
     }
 
@@ -563,7 +571,109 @@ impl<'a> ExecutionContext<'a> {
             kv_cache,
             kv_geometry: None,
             scratch: None,
+            feature_input: None,
+            feature_dims: None,
+            soft_prompt_embeds: None,
+            soft_prompt_dims: None,
         })
+    }
+
+    /// Creates a non-tokenized [`ExecutionContext`] bound to a continuous `f32` feature matrix
+    /// (`num_rows` x `num_cols`) with `prompt_tokens` left empty.
+    ///
+    /// Rejects non-finite values (`NaN`, `±Inf`), zero dimensions, `usize` overflow, or length
+    /// mismatches upfront before constructing the context.
+    ///
+    /// # Errors
+    /// Returns [`K3Error::ContextLengthExceeded`] if `n_ctx == 0`, or
+    /// [`K3Error::TensorBoundsError`] if `num_rows == 0`, `num_cols == 0`, `num_rows * num_cols`
+    /// overflows `usize`, `features.len() != num_rows * num_cols`, or any element of `features`
+    /// is non-finite (`NaN` or `±Inf`).
+    pub fn new_feature_input(
+        features: &'a [f32],
+        num_rows: usize,
+        num_cols: usize,
+        n_ctx: usize,
+        logits: &'a mut [f32],
+        kv_cache: &'a mut [f32],
+    ) -> Result<Self, K3Error> {
+        if n_ctx == 0 {
+            return Err(K3Error::ContextLengthExceeded {
+                requested_tokens: num_rows,
+                max_context_tokens: 0,
+            });
+        }
+        Self::new(&[], n_ctx, logits, kv_cache)?.with_feature_input(features, num_rows, num_cols)
+    }
+
+    /// Attaches a continuous `f32` feature matrix (`num_rows` x `num_cols`) to this
+    /// [`ExecutionContext`] for machine-model inference without token IDs.
+    ///
+    /// Validates non-zero dimensions, `usize` multiplication bounds, exact slice length, and
+    /// upfront finiteness (`is_finite()`) for every element before mutating `self`.
+    ///
+    /// # Errors
+    /// Returns [`K3Error::TensorBoundsError`] if `num_rows == 0`, `num_cols == 0`,
+    /// `num_rows * num_cols` overflows `usize`, `features.len() != num_rows * num_cols`, or any
+    /// element in `features` is `NaN` or `±Inf`.
+    pub fn with_feature_input(
+        mut self,
+        features: &'a [f32],
+        num_rows: usize,
+        num_cols: usize,
+    ) -> Result<Self, K3Error> {
+        validate_finite_matrix("feature_input", features, num_rows, num_cols)?;
+        self.feature_input = Some(features);
+        self.feature_dims = Some((num_rows, num_cols));
+        Ok(self)
+    }
+
+    /// Attaches pre-projected soft-prompt embedding vectors (`num_tokens` x `embed_dim`) for
+    /// token-free prefix conditioning in sequence recipes.
+    ///
+    /// Validates dimensions, sequence capacity (`self.position + num_tokens <= n_ctx`), and
+    /// upfront finiteness (`is_finite()`) for every element before mutating `self`.
+    ///
+    /// # Errors
+    /// Returns [`K3Error::TensorBoundsError`] if dimensions are zero, overflow `usize`, mismatch
+    /// `embeds.len()`, or any element in `embeds` is `NaN` or `±Inf`, and returns
+    /// [`K3Error::ContextLengthExceeded`] if `self.position + num_tokens` exceeds context limits.
+    pub fn with_soft_prompt_embeds(
+        mut self,
+        embeds: &'a [f32],
+        num_tokens: usize,
+        embed_dim: usize,
+    ) -> Result<Self, K3Error> {
+        validate_finite_matrix("soft_prompt_embeds", embeds, num_tokens, embed_dim)?;
+        validate_context_range(self.position, num_tokens, self.effective_context_limit())?;
+        self.soft_prompt_embeds = Some(embeds);
+        self.soft_prompt_dims = Some((num_tokens, embed_dim));
+        Ok(self)
+    }
+
+    /// Returns the attached continuous numerical feature matrix slice, if configured.
+    #[must_use]
+    pub const fn feature_input(&self) -> Option<&'a [f32]> {
+        self.feature_input
+    }
+
+    /// Returns the dimensions `(num_rows, num_cols)` of the attached feature matrix, if configured.
+    #[must_use]
+    pub const fn feature_dims(&self) -> Option<(usize, usize)> {
+        self.feature_dims
+    }
+
+    /// Returns the attached soft-prompt embedding matrix slice, if configured.
+    #[must_use]
+    pub const fn soft_prompt_embeds(&self) -> Option<&'a [f32]> {
+        self.soft_prompt_embeds
+    }
+
+    /// Returns the dimensions `(num_tokens, embed_dim)` of the attached soft-prompt embeddings, if
+    /// configured.
+    #[must_use]
+    pub const fn soft_prompt_dims(&self) -> Option<(usize, usize)> {
+        self.soft_prompt_dims
     }
 
     const fn effective_context_limit(&self) -> usize {
@@ -850,6 +960,164 @@ const fn validate_context_range(
         });
     }
     Ok(end_pos)
+}
+
+fn validate_finite_matrix(
+    tensor_name: &str,
+    data: &[f32],
+    rows: usize,
+    cols: usize,
+) -> Result<(), K3Error> {
+    if rows == 0 || cols == 0 {
+        return Err(K3Error::TensorBoundsError {
+            tensor_name: tensor_name.to_owned(),
+            offset: 0,
+            byte_len: 0,
+            buffer_len: size_of_val(data),
+            reason: format!("{tensor_name} dimensions ({rows}x{cols}) must both be non-zero"),
+        });
+    }
+    let expected_len = rows
+        .checked_mul(cols)
+        .ok_or_else(|| K3Error::TensorBoundsError {
+            tensor_name: tensor_name.to_owned(),
+            offset: 0,
+            byte_len: usize::MAX,
+            buffer_len: size_of_val(data),
+            reason: format!("{tensor_name} dimensions ({rows}x{cols}) overflowed usize"),
+        })?;
+    if data.len() != expected_len {
+        return Err(K3Error::TensorBoundsError {
+            tensor_name: tensor_name.to_owned(),
+            offset: 0,
+            byte_len: expected_len.saturating_mul(size_of::<f32>()),
+            buffer_len: size_of_val(data),
+            reason: format!(
+                "{tensor_name} element count {} does not match expected {rows}x{cols} ({expected_len})",
+                data.len()
+            ),
+        });
+    }
+    for (idx, &val) in data.iter().enumerate() {
+        if !val.is_finite() {
+            return Err(K3Error::TensorBoundsError {
+                tensor_name: tensor_name.to_owned(),
+                offset: idx.saturating_mul(size_of::<f32>()),
+                byte_len: size_of::<f32>(),
+                buffer_len: size_of_val(data),
+                reason: format!("non-finite f32 value ({val}) in {tensor_name} at index {idx}"),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Validates finite feature matrices and applies z-score normalization clamped to
+/// `[-clip_sigma, clip_sigma]` before kernel dispatch.
+///
+/// Rejects `NaN`, `±Inf`, non-positive standard deviations (`stds <= 0.0`), non-positive or
+/// non-finite `clip_sigma`, empty inputs, or mismatched row/column lengths upfront with
+/// [`K3Error::TensorBoundsError`] prior to mutating `out`.
+///
+/// # Errors
+/// Returns [`K3Error::TensorBoundsError`] if:
+/// - `clip_sigma` is non-finite or `<= 0.0`,
+/// - `means` or `raw` is empty,
+/// - `means.len() != stds.len()` or `out.len() != raw.len()`,
+/// - `raw.len()` is not an exact multiple of `means.len()`,
+/// - any element in `means` is non-finite (`NaN` or `±Inf`),
+/// - any element in `stds` is non-finite or `<= 0.0`, or
+/// - any element in `raw` is `NaN` or `±Inf`.
+pub fn sanitize_and_normalize_features(
+    out: &mut [f32],
+    raw: &[f32],
+    means: &[f32],
+    stds: &[f32],
+    clip_sigma: f32,
+) -> Result<(), K3Error> {
+    if !clip_sigma.is_finite() || clip_sigma <= 0.0 {
+        return Err(K3Error::TensorBoundsError {
+            tensor_name: "clip_sigma".to_owned(),
+            offset: 0,
+            byte_len: size_of::<f32>(),
+            buffer_len: size_of::<f32>(),
+            reason: format!("clip_sigma ({clip_sigma}) must be finite and strictly positive"),
+        });
+    }
+    if means.is_empty() || means.len() != stds.len() {
+        return Err(K3Error::TensorBoundsError {
+            tensor_name: "zscore_stats".to_owned(),
+            offset: 0,
+            byte_len: size_of_val(means),
+            buffer_len: size_of_val(stds),
+            reason: format!(
+                "z-score stats require non-empty equal lengths (means={}, stds={})",
+                means.len(),
+                stds.len()
+            ),
+        });
+    }
+    let num_cols = means.len();
+    if raw.is_empty() || out.len() != raw.len() || raw.len() % num_cols != 0 {
+        return Err(K3Error::TensorBoundsError {
+            tensor_name: "feature_input".to_owned(),
+            offset: 0,
+            byte_len: size_of_val(raw),
+            buffer_len: size_of_val(out),
+            reason: format!(
+                "feature slice lengths (raw={}, out={}) must be non-empty, equal, and divisible by num_cols={num_cols}",
+                raw.len(),
+                out.len()
+            ),
+        });
+    }
+    for (col, (&mean, &std)) in means.iter().zip(stds.iter()).enumerate() {
+        if !mean.is_finite() {
+            return Err(K3Error::TensorBoundsError {
+                tensor_name: "zscore_mean".to_owned(),
+                offset: col.saturating_mul(size_of::<f32>()),
+                byte_len: size_of::<f32>(),
+                buffer_len: size_of_val(means),
+                reason: format!("non-finite zscore_mean ({mean}) at column {col}"),
+            });
+        }
+        if !(std.is_finite() && std > 0.0) {
+            return Err(K3Error::TensorBoundsError {
+                tensor_name: "zscore_std".to_owned(),
+                offset: col.saturating_mul(size_of::<f32>()),
+                byte_len: size_of::<f32>(),
+                buffer_len: size_of_val(stds),
+                reason: format!(
+                    "zscore_std ({std}) at column {col} must be finite and strictly positive"
+                ),
+            });
+        }
+    }
+    for (idx, &val) in raw.iter().enumerate() {
+        if !val.is_finite() {
+            return Err(K3Error::TensorBoundsError {
+                tensor_name: "feature_input".to_owned(),
+                offset: idx.saturating_mul(size_of::<f32>()),
+                byte_len: size_of::<f32>(),
+                buffer_len: size_of_val(raw),
+                reason: format!("non-finite raw feature ({val}) at index {idx}"),
+            });
+        }
+    }
+
+    for (out_row, raw_row) in out
+        .chunks_exact_mut(num_cols)
+        .zip(raw.chunks_exact(num_cols))
+    {
+        for ((dst, &val), (&mean, &std)) in out_row
+            .iter_mut()
+            .zip(raw_row.iter())
+            .zip(means.iter().zip(stds.iter()))
+        {
+            *dst = ((val - mean) / std).clamp(-clip_sigma, clip_sigma);
+        }
+    }
+    Ok(())
 }
 
 /// Architecture recipe trait compiled in-process per ADR-023 and ADR-024.
@@ -1667,5 +1935,184 @@ mod tests {
         }
 
         assert!(scratch.peak_used_bytes() >= 128 + 32);
+    }
+
+    #[test]
+    fn test_execution_context_with_feature_input() {
+        let features = [1.0_f32, -2.5, 3.25, 0.0, 4.5, -1.25];
+        let mut logits = [0.0_f32; 4];
+        let mut kv_cache = [0.0_f32; 16];
+
+        let ctx = ExecutionContext::new(&[], 8, &mut logits, &mut kv_cache)
+            .expect("empty-token context succeeds")
+            .with_feature_input(&features, 2, 3)
+            .expect("with_feature_input succeeds");
+
+        assert_eq!(ctx.prompt_tokens(), [0_u32; 0]);
+        assert_eq!(ctx.feature_input(), Some(&features[..]));
+        assert_eq!(ctx.feature_dims(), Some((2, 3)));
+        assert_eq!(ctx.soft_prompt_embeds(), None);
+        assert_eq!(ctx.soft_prompt_dims(), None);
+
+        let zero_rows = ExecutionContext::new(&[], 8, &mut logits, &mut kv_cache)
+            .expect("ctx")
+            .with_feature_input(&features, 0, 3);
+        assert!(matches!(zero_rows, Err(K3Error::TensorBoundsError { .. })));
+
+        let mismatch = ExecutionContext::new(&[], 8, &mut logits, &mut kv_cache)
+            .expect("ctx")
+            .with_feature_input(&features, 2, 2);
+        assert!(matches!(mismatch, Err(K3Error::TensorBoundsError { .. })));
+
+        let overflow = ExecutionContext::new(&[], 8, &mut logits, &mut kv_cache)
+            .expect("ctx")
+            .with_feature_input(&features, usize::MAX, 2);
+        assert!(matches!(overflow, Err(K3Error::TensorBoundsError { .. })));
+    }
+
+    #[test]
+    fn test_execution_context_feature_input_nan_rejection() {
+        let mut logits = [0.0_f32; 4];
+        let mut kv_cache = [0.0_f32; 16];
+
+        for bad_val in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let bad_features = [1.0_f32, bad_val, 3.0, 4.0];
+            let err = ExecutionContext::new(&[], 8, &mut logits, &mut kv_cache)
+                .expect("ctx")
+                .with_feature_input(&bad_features, 2, 2);
+            assert!(matches!(err, Err(K3Error::TensorBoundsError { .. })));
+
+            let direct_err = ExecutionContext::new_feature_input(
+                &bad_features,
+                2,
+                2,
+                8,
+                &mut logits,
+                &mut kv_cache,
+            );
+            assert!(matches!(direct_err, Err(K3Error::TensorBoundsError { .. })));
+        }
+
+        let clean = [0.25_f32, 0.5, 0.75, 1.0];
+        let ok_ctx =
+            ExecutionContext::new_feature_input(&clean, 2, 2, 8, &mut logits, &mut kv_cache)
+                .expect("valid new_feature_input");
+        assert_eq!(ok_ctx.feature_input(), Some(&clean[..]));
+        assert_eq!(ok_ctx.feature_dims(), Some((2, 2)));
+        assert_eq!(ok_ctx.prompt_tokens(), [0_u32; 0]);
+
+        let zero_ctx =
+            ExecutionContext::new_feature_input(&clean, 2, 2, 0, &mut logits, &mut kv_cache);
+        assert!(matches!(
+            zero_ctx,
+            Err(K3Error::ContextLengthExceeded { .. })
+        ));
+    }
+
+    #[test]
+    fn test_execution_context_with_soft_prompt_embeds() {
+        let embeds = [0.1_f32, -0.2, 0.3, 0.4, -0.5, 0.6];
+        let mut logits = [0.0_f32; 4];
+        let mut kv_cache = [0.0_f32; 16];
+
+        let ctx = ExecutionContext::new(&[], 4, &mut logits, &mut kv_cache)
+            .expect("ctx")
+            .with_soft_prompt_embeds(&embeds, 2, 3)
+            .expect("valid soft prompt embeds");
+        assert_eq!(ctx.soft_prompt_embeds(), Some(&embeds[..]));
+        assert_eq!(ctx.soft_prompt_dims(), Some((2, 3)));
+
+        let too_many_tokens = ExecutionContext::new(&[], 1, &mut logits, &mut kv_cache)
+            .expect("ctx")
+            .with_soft_prompt_embeds(&embeds, 2, 3);
+        assert!(matches!(
+            too_many_tokens,
+            Err(K3Error::ContextLengthExceeded { .. })
+        ));
+
+        let bad_embeds = [0.1_f32, f32::NAN, 0.3, 0.4];
+        let nan_err = ExecutionContext::new(&[], 4, &mut logits, &mut kv_cache)
+            .expect("ctx")
+            .with_soft_prompt_embeds(&bad_embeds, 2, 2);
+        assert!(matches!(nan_err, Err(K3Error::TensorBoundsError { .. })));
+    }
+
+    #[test]
+    fn test_sanitize_features_rejects_nan_inf() {
+        let means = [10.0_f32, 20.0_f32];
+        let stds = [2.0_f32, 5.0_f32];
+        let sentinel = 999.0_f32;
+
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let raw = [10.0_f32, 20.0, 12.0, bad];
+            let mut out = [sentinel; 4];
+            let err = sanitize_and_normalize_features(&mut out, &raw, &means, &stds, 3.0);
+            assert!(matches!(err, Err(K3Error::TensorBoundsError { .. })));
+            // Fail-closed invariant: output buffer remains completely unmutated on upfront error.
+            assert!(out.iter().all(|&x| x.to_bits() == sentinel.to_bits()));
+        }
+
+        let valid_raw = [10.0_f32, 20.0];
+        let mut out = [sentinel; 2];
+        assert!(matches!(
+            sanitize_and_normalize_features(&mut out, &valid_raw, &[f32::NAN, 1.0], &stds, 3.0),
+            Err(K3Error::TensorBoundsError { .. })
+        ));
+        assert!(matches!(
+            sanitize_and_normalize_features(&mut out, &valid_raw, &means, &[2.0, 0.0], 3.0),
+            Err(K3Error::TensorBoundsError { .. })
+        ));
+        assert!(matches!(
+            sanitize_and_normalize_features(&mut out, &valid_raw, &means, &[2.0, -1.0], 3.0),
+            Err(K3Error::TensorBoundsError { .. })
+        ));
+        assert!(matches!(
+            sanitize_and_normalize_features(
+                &mut out,
+                &valid_raw,
+                &means,
+                &[2.0, f32::INFINITY],
+                3.0
+            ),
+            Err(K3Error::TensorBoundsError { .. })
+        ));
+        assert!(matches!(
+            sanitize_and_normalize_features(&mut out, &valid_raw, &means, &stds, 0.0),
+            Err(K3Error::TensorBoundsError { .. })
+        ));
+        assert!(matches!(
+            sanitize_and_normalize_features(&mut out, &valid_raw, &means, &stds, f32::NAN),
+            Err(K3Error::TensorBoundsError { .. })
+        ));
+        assert!(out.iter().all(|&x| x.to_bits() == sentinel.to_bits()));
+    }
+
+    #[test]
+    fn test_sanitize_and_normalize_features() {
+        let raw = [10.0_f32, 15.0, 30.0, 100.0, -10.0, 0.0];
+        let means = [10.0_f32, 20.0];
+        let stds = [2.0_f32, 5.0];
+        let mut out = [0.0_f32; 6];
+
+        sanitize_and_normalize_features(&mut out, &raw, &means, &stds, 3.0)
+            .expect("valid sanitization and z-score clamping");
+
+        let expected = [0.0_f32, -1.0, 3.0, 3.0, -3.0, -3.0];
+        assert_bit_identical(&out, &expected, "zscore_clamped_output");
+
+        let mut short_out = [0.0_f32; 5];
+        assert!(matches!(
+            sanitize_and_normalize_features(&mut short_out, &raw, &means, &stds, 3.0),
+            Err(K3Error::TensorBoundsError { .. })
+        ));
+        let mut odd_out = [0.0_f32; 3];
+        assert!(matches!(
+            sanitize_and_normalize_features(&mut odd_out, &[1.0, 2.0, 3.0], &means, &stds, 3.0),
+            Err(K3Error::TensorBoundsError { .. })
+        ));
+        assert!(matches!(
+            sanitize_and_normalize_features(&mut [], &[], &means, &stds, 3.0),
+            Err(K3Error::TensorBoundsError { .. })
+        ));
     }
 }
