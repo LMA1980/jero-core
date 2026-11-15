@@ -1,7 +1,7 @@
 //! Cross-platform shared memory arena abstraction backed by Linux `memfd_create`
 //! or macOS `shm_open` / temporary unlinked file, with `SCM_RIGHTS` FD transfer.
 
-use core::mem::size_of;
+use core::mem::{align_of, size_of};
 use std::fmt;
 use std::fs::OpenOptions;
 use std::io;
@@ -12,9 +12,12 @@ use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use sendfd::{RecvWithFd, SendWithFd};
-use zerocopy::FromBytes;
+use zerocopy::{FromBytes, IntoBytes};
 
-use super::layout::{ArenaHeader, KvBlockMeta, KvBlockTag};
+use super::layout::{
+    ArenaHeader, FeatureDtype, FeatureInputSlotHeader, KvBlockMeta, KvBlockTag,
+    build_validated_feature_slot, decode_feature_payload_to_f32, validate_feature_payload,
+};
 use crate::error::K3Error;
 
 /// Operator memlock limit ceiling: 28 GiB (Rule 5, ADR-037).
@@ -868,6 +871,201 @@ impl SharedMemoryArena {
         self.is_locked = false;
         Ok(())
     }
+
+    fn check_feature_slot_alignment(&self, offset: usize) -> Result<(), K3Error> {
+        let required_align = align_of::<FeatureInputSlotHeader>();
+        if offset % required_align != 0 {
+            return Err(K3Error::TensorBoundsError {
+                tensor_name: "feature_input_header".to_owned(),
+                offset,
+                byte_len: size_of::<FeatureInputSlotHeader>(),
+                buffer_len: self.len,
+                reason: format!(
+                    "feature slot offset {offset} is not aligned to {required_align}-byte boundary"
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    /// Returns a validated shared zero-copy reference to the [`FeatureInputSlotHeader`] at
+    /// byte `offset`.
+    ///
+    /// # Errors
+    /// Returns [`K3Error::TensorBoundsError`] if `offset` is misaligned, out of bounds, or the
+    /// header fails field validation.
+    pub fn feature_slot_header(&self, offset: usize) -> Result<&FeatureInputSlotHeader, K3Error> {
+        self.check_feature_slot_alignment(offset)?;
+        let header_len = size_of::<FeatureInputSlotHeader>();
+        let slice = self.slice(offset, header_len)?;
+        let header = FeatureInputSlotHeader::ref_from_bytes(slice).map_err(|e| {
+            K3Error::TensorBoundsError {
+                tensor_name: "feature_input_header".to_owned(),
+                offset,
+                byte_len: header_len,
+                buffer_len: self.len,
+                reason: format!("failed to read FeatureInputSlotHeader: {e}"),
+            }
+        })?;
+        let _ = header.validate()?;
+        Ok(header)
+    }
+
+    /// Writes a validated [`FeatureInputSlotHeader`] and little-endian typed feature payload at
+    /// cacheline-aligned byte `offset`.
+    ///
+    /// Rejects misalignment, `read_only` mapping, `NaN`/`±Inf` values (`F32`/`F16`), dimension
+    /// errors, or capacity overflow upfront before writing to the arena, returning total bytes
+    /// written (`64 + payload.len()`).
+    ///
+    /// # Errors
+    /// Returns [`K3Error::TensorBoundsError`] on invalid alignment, read-only mapping, bounds, or
+    /// non-finite values.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "arena slot writer exposes explicit offset, metadata, and typed matrix bounds"
+    )]
+    pub fn write_feature_slot(
+        &mut self,
+        offset: usize,
+        slot_seq_id: u64,
+        dtype: FeatureDtype,
+        num_rows: usize,
+        num_cols: usize,
+        payload: &[u8],
+        normalized: bool,
+        schema_hash: u64,
+    ) -> Result<usize, K3Error> {
+        self.check_feature_slot_alignment(offset)?;
+        let (header, total_bytes) = build_validated_feature_slot(
+            slot_seq_id,
+            dtype,
+            num_rows,
+            num_cols,
+            payload,
+            normalized,
+            schema_hash,
+            self.len,
+        )?;
+        let dst = self.slice_mut(offset, total_bytes)?;
+        let header_len = size_of::<FeatureInputSlotHeader>();
+        dst[..header_len].copy_from_slice(header.as_bytes());
+        dst[header_len..total_bytes].copy_from_slice(payload);
+        Ok(total_bytes)
+    }
+
+    /// Convenience helper writing a contiguous `f32` matrix (`num_rows` x `num_cols`) as a
+    /// validated [`FeatureDtype::F32`] feature slot at `offset`.
+    ///
+    /// # Errors
+    /// Returns [`K3Error::TensorBoundsError`] if validation or bounds checks fail.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "arena f32 slot writer exposes explicit offset and schema metadata"
+    )]
+    pub fn write_f32_feature_slot(
+        &mut self,
+        offset: usize,
+        slot_seq_id: u64,
+        num_rows: usize,
+        num_cols: usize,
+        features: &[f32],
+        normalized: bool,
+        schema_hash: u64,
+    ) -> Result<usize, K3Error> {
+        #[cfg(target_endian = "little")]
+        {
+            self.write_feature_slot(
+                offset,
+                slot_seq_id,
+                FeatureDtype::F32,
+                num_rows,
+                num_cols,
+                features.as_bytes(),
+                normalized,
+                schema_hash,
+            )
+        }
+        #[cfg(not(target_endian = "little"))]
+        {
+            let mut bytes = Vec::with_capacity(features.len().saturating_mul(4));
+            for &val in features {
+                bytes.extend_from_slice(&val.to_le_bytes());
+            }
+            self.write_feature_slot(
+                offset,
+                slot_seq_id,
+                FeatureDtype::F32,
+                num_rows,
+                num_cols,
+                &bytes,
+                normalized,
+                schema_hash,
+            )
+        }
+    }
+
+    /// Reads and validates the [`FeatureInputSlotHeader`] and raw little-endian payload slice at
+    /// cacheline-aligned byte `offset`, rejecting `NaN`/`±Inf` values (`F32`/`F16`) upfront.
+    ///
+    /// # Errors
+    /// Returns [`K3Error::TensorBoundsError`] if alignment, bounds, header, or finiteness checks fail.
+    pub fn read_feature_slot_bytes(
+        &self,
+        offset: usize,
+    ) -> Result<(&FeatureInputSlotHeader, &[u8]), K3Error> {
+        let header = self.feature_slot_header(offset)?;
+        let payload_len = header.validate()?;
+        let header_len = size_of::<FeatureInputSlotHeader>();
+        let payload_offset =
+            offset
+                .checked_add(header_len)
+                .ok_or_else(|| K3Error::TensorBoundsError {
+                    tensor_name: "feature_input_slot".to_owned(),
+                    offset,
+                    byte_len: payload_len,
+                    buffer_len: self.len,
+                    reason: "feature slot payload offset overflowed usize".to_owned(),
+                })?;
+        let payload = self.slice(payload_offset, payload_len)?;
+        validate_feature_payload(
+            header.feature_dtype()?,
+            header.num_rows as usize,
+            header.num_cols as usize,
+            payload,
+        )?;
+        Ok((header, payload))
+    }
+
+    /// Reads, validates, and decodes the numerical feature matrix stored at `offset` into `Vec<f32>`.
+    ///
+    /// Supports [`FeatureDtype::F32`], [`FeatureDtype::F16`], [`FeatureDtype::I32`], and
+    /// [`FeatureDtype::I8`].
+    ///
+    /// # Errors
+    /// Returns [`K3Error::TensorBoundsError`] if alignment, bounds, header, or finiteness checks fail.
+    pub fn read_feature_slot_as_f32(
+        &self,
+        offset: usize,
+    ) -> Result<(FeatureInputSlotHeader, Vec<f32>), K3Error> {
+        let (header_ref, payload) = self.read_feature_slot_bytes(offset)?;
+        let header = *header_ref;
+        let dtype = header.feature_dtype()?;
+        let rows = header.num_rows as usize;
+        let cols = header.num_cols as usize;
+        let elems = rows
+            .checked_mul(cols)
+            .ok_or_else(|| K3Error::TensorBoundsError {
+                tensor_name: "feature_input".to_owned(),
+                offset,
+                byte_len: usize::MAX,
+                buffer_len: self.len,
+                reason: "feature matrix element count overflowed usize".to_owned(),
+            })?;
+        let mut out = vec![0.0_f32; elems];
+        decode_feature_payload_to_f32(dtype, rows, cols, payload, &mut out)?;
+        Ok((header, out))
+    }
 }
 
 impl Drop for SharedMemoryArena {
@@ -1082,5 +1280,117 @@ mod tests {
                 K3Error::InsufficientLockableMemory { .. }
             ))
         ));
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_arena_feature_slot_roundtrip_and_sanitization() {
+        let mut arena = SharedMemoryArena::create("feature_arena", 8192).expect("feature arena");
+        let slot_offset = 1024;
+
+        // Write F32 matrix (2x3)
+        let f32_matrix = [1.25_f32, -0.5, 3.0, 4.5, -6.25, 0.0];
+        let written = arena
+            .write_f32_feature_slot(slot_offset, 77, 2, 3, &f32_matrix, true, 0xCAFE_1234)
+            .expect("write f32 feature slot");
+        assert_eq!(written, 64 + 24);
+
+        let (hdr, decoded) = arena
+            .read_feature_slot_as_f32(slot_offset)
+            .expect("read f32 feature slot");
+        assert_eq!(hdr.slot_seq_id, 77);
+        assert_eq!(hdr.num_rows, 2);
+        assert_eq!(hdr.num_cols, 3);
+        assert!(hdr.is_normalized());
+        assert_eq!(hdr.schema_hash, 0xCAFE_1234);
+        assert_eq!(decoded.len(), f32_matrix.len());
+        for (a, b) in decoded.iter().zip(f32_matrix.iter()) {
+            assert_eq!(a.to_bits(), b.to_bits());
+        }
+
+        // Write F16 matrix (1x2: 1.0, -2.0) at another cacheline-aligned slot
+        let f16_offset = 2048;
+        let mut f16_payload = [0_u8; 4];
+        f16_payload[0..2].copy_from_slice(&0x3C00_u16.to_le_bytes());
+        f16_payload[2..4].copy_from_slice(&0xC000_u16.to_le_bytes());
+        arena
+            .write_feature_slot(
+                f16_offset,
+                88,
+                FeatureDtype::F16,
+                1,
+                2,
+                &f16_payload,
+                false,
+                55,
+            )
+            .expect("write f16 slot");
+        let (_, f16_decoded) = arena
+            .read_feature_slot_as_f32(f16_offset)
+            .expect("read f16 slot");
+        assert_eq!(f16_decoded[0].to_bits(), 1.0_f32.to_bits());
+        assert_eq!(f16_decoded[1].to_bits(), (-2.0_f32).to_bits());
+
+        // Write I32 and I8 matrices at cacheline-aligned slots
+        let i32_offset = 2560;
+        let i32_bytes = [(-9_i32).to_le_bytes(), 12_i32.to_le_bytes()].concat();
+        arena
+            .write_feature_slot(
+                i32_offset,
+                89,
+                FeatureDtype::I32,
+                1,
+                2,
+                &i32_bytes,
+                false,
+                56,
+            )
+            .expect("write i32 slot");
+        let (_, i32_decoded) = arena
+            .read_feature_slot_as_f32(i32_offset)
+            .expect("read i32 slot");
+        assert_eq!(i32_decoded[0].to_bits(), (-9.0_f32).to_bits());
+        assert_eq!(i32_decoded[1].to_bits(), 12.0_f32.to_bits());
+
+        let i8_offset = 3072;
+        let i8_bytes = [(-128_i8).to_le_bytes()[0], 127_u8];
+        arena
+            .write_feature_slot(i8_offset, 90, FeatureDtype::I8, 1, 2, &i8_bytes, false, 57)
+            .expect("write i8 slot");
+        let (_, i8_decoded) = arena
+            .read_feature_slot_as_f32(i8_offset)
+            .expect("read i8 slot");
+        assert_eq!(i8_decoded[0].to_bits(), (-128.0_f32).to_bits());
+        assert_eq!(i8_decoded[1].to_bits(), 127.0_f32.to_bits());
+
+        // Upfront NaN rejection leaves previously committed slot untouched
+        let bad_matrix = [1.0_f32, f32::NAN, 3.0, 4.0, 5.0, 6.0];
+        let bad_write =
+            arena.write_f32_feature_slot(slot_offset, 91, 2, 3, &bad_matrix, false, 999);
+        assert!(matches!(bad_write, Err(K3Error::TensorBoundsError { .. })));
+        let (preserved_hdr, preserved_vals) = arena
+            .read_feature_slot_as_f32(slot_offset)
+            .expect("previous slot remains valid");
+        assert_eq!(preserved_hdr.slot_seq_id, 77);
+        assert_eq!(preserved_vals[1].to_bits(), (-0.5_f32).to_bits());
+
+        // Misaligned offset and read-only mapping reject cleanly
+        assert!(matches!(
+            arena.write_f32_feature_slot(slot_offset + 8, 92, 1, 2, &[1.0, 2.0], false, 0),
+            Err(K3Error::TensorBoundsError { .. })
+        ));
+        let dup_fd = arena.duplicate_fd().expect("dup fd");
+        let mut ro_arena =
+            SharedMemoryArena::from_existing_fd(dup_fd, arena.len(), "ro_feature", true)
+                .expect("read-only arena");
+        assert!(matches!(
+            ro_arena.write_f32_feature_slot(slot_offset, 93, 1, 2, &[1.0, 2.0], false, 0),
+            Err(K3Error::TensorBoundsError { .. })
+        ));
+        let (ro_hdr, ro_vals) = ro_arena
+            .read_feature_slot_as_f32(slot_offset)
+            .expect("read from read-only mapped arena");
+        assert_eq!(ro_hdr.slot_seq_id, 77);
+        assert_eq!(ro_vals.len(), 6);
     }
 }

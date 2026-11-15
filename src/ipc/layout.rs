@@ -10,7 +10,10 @@ use core::mem::{align_of, size_of};
 
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
-use super::protocol::{KV_DTYPE_F16, KV_DTYPE_F32, KV_DTYPE_Q8_0};
+use super::protocol::{
+    FEATURE_DTYPE_F16, FEATURE_DTYPE_F32, FEATURE_DTYPE_I8, FEATURE_DTYPE_I32, KV_DTYPE_F16,
+    KV_DTYPE_F32, KV_DTYPE_Q8_0,
+};
 use crate::error::K3Error;
 use crate::tensor::QuantType;
 
@@ -254,6 +257,138 @@ impl TryFrom<u8> for KvDtype {
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         Self::from_u8(value)
     }
+}
+
+/// Element dtype for non-tokenized numerical feature matrices stored in shared memory arenas.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum FeatureDtype {
+    /// 32-bit IEEE 754 float (`4` bytes per element, wire default).
+    #[default]
+    F32 = FEATURE_DTYPE_F32,
+    /// 16-bit IEEE 754 binary16 float (`2` bytes per element, raw little-endian bits).
+    F16 = FEATURE_DTYPE_F16,
+    /// 32-bit two's complement signed integer (`4` bytes per element, little-endian).
+    I32 = FEATURE_DTYPE_I32,
+    /// 8-bit two's complement signed integer (`1` byte per element).
+    I8 = FEATURE_DTYPE_I8,
+}
+
+impl FeatureDtype {
+    /// Decodes a raw `u8` tag into [`FeatureDtype`] without constructing an owned error.
+    #[must_use]
+    pub const fn try_from_u8(value: u8) -> Option<Self> {
+        match value {
+            FEATURE_DTYPE_F32 => Some(Self::F32),
+            FEATURE_DTYPE_F16 => Some(Self::F16),
+            FEATURE_DTYPE_I32 => Some(Self::I32),
+            FEATURE_DTYPE_I8 => Some(Self::I8),
+            _ => None,
+        }
+    }
+
+    /// Decodes a raw `u8` tag into [`FeatureDtype`].
+    ///
+    /// # Errors
+    /// Returns [`K3Error::TensorBoundsError`] if `value` is outside `0..=3`.
+    pub fn from_u8(value: u8) -> Result<Self, K3Error> {
+        Self::try_from_u8(value).ok_or_else(|| K3Error::TensorBoundsError {
+            tensor_name: "feature_input".to_owned(),
+            offset: 0,
+            byte_len: 1,
+            buffer_len: 1,
+            reason: format!(
+                "unsupported FeatureDtype tag {value}: expected 0 (F32), 1 (F16), 2 (I32), or 3 (I8)"
+            ),
+        })
+    }
+
+    /// Returns the wire/header numeric discriminator for this dtype.
+    #[must_use]
+    pub const fn as_u8(self) -> u8 {
+        self as u8
+    }
+
+    /// Returns the fixed per-element byte size for this dtype.
+    #[must_use]
+    pub const fn element_bytes(self) -> usize {
+        match self {
+            Self::F32 | Self::I32 => 4,
+            Self::F16 => 2,
+            Self::I8 => 1,
+        }
+    }
+
+    /// Computes the exact serialized byte footprint for a `num_rows` x `num_cols` feature matrix.
+    ///
+    /// # Errors
+    /// Returns [`K3Error::TensorBoundsError`] if either dimension is zero or the byte product
+    /// overflows `usize`.
+    pub fn matrix_bytes(self, num_rows: usize, num_cols: usize) -> Result<usize, K3Error> {
+        if num_rows == 0 || num_cols == 0 {
+            return Err(K3Error::TensorBoundsError {
+                tensor_name: "feature_input".to_owned(),
+                offset: 0,
+                byte_len: 0,
+                buffer_len: 0,
+                reason: format!(
+                    "FeatureDtype::matrix_bytes requires non-zero dimensions, got {num_rows}x{num_cols}"
+                ),
+            });
+        }
+        num_rows
+            .checked_mul(num_cols)
+            .and_then(|elems| elems.checked_mul(self.element_bytes()))
+            .ok_or_else(|| K3Error::TensorBoundsError {
+                tensor_name: "feature_input".to_owned(),
+                offset: 0,
+                byte_len: usize::MAX,
+                buffer_len: 0,
+                reason: format!(
+                    "FeatureDtype::{self:?} matrix_bytes overflowed usize for {num_rows}x{num_cols}"
+                ),
+            })
+    }
+}
+
+impl TryFrom<u8> for FeatureDtype {
+    type Error = K3Error;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        Self::from_u8(value)
+    }
+}
+
+/// Converts a raw IEEE 754 binary16 (`f16`) bit pattern into `f32`.
+///
+/// Preserves signed zeros (`±0.0`), normal and subnormal values, infinities (`±Inf`), and
+/// quiet `NaN` values across all 65,536 bit patterns without precision loss.
+#[must_use]
+pub const fn f16_bits_to_f32(bits: u16) -> f32 {
+    let sign = ((bits & 0x8000) as u32) << 16;
+    let exp = ((bits >> 10) & 0x001F) as u32;
+    let frac = (bits & 0x03FF) as u32;
+
+    if exp == 0x1F {
+        if frac == 0 {
+            return f32::from_bits(sign | 0x7F80_0000);
+        }
+        // Set quiet NaN bit so every non-zero payload remains NaN.
+        return f32::from_bits(sign | 0x7FC0_0000 | (frac << 13));
+    }
+
+    if exp == 0 {
+        if frac == 0 {
+            return f32::from_bits(sign);
+        }
+        let shift = frac.leading_zeros() - 21;
+        let norm_frac = (frac << shift) & 0x03FF;
+        let f32_exp = (127 - 14 - shift) << 23;
+        return f32::from_bits(sign | f32_exp | (norm_frac << 13));
+    }
+
+    let f32_exp = (exp + 112) << 23;
+    f32::from_bits(sign | f32_exp | (frac << 13))
 }
 
 /// Fixed 128-byte header aligned to 64-byte cacheline boundaries at offset 0 of the arena.
@@ -780,6 +915,425 @@ pub fn estimate_recurrent_state_bytes(
         .ok_or_else(overflow_err)
 }
 
+/// 64-byte cacheline-aligned header preceding a non-tokenized numerical feature matrix
+/// payload in shared memory.
+///
+/// Followed immediately at byte offset `64` (`size_of::<FeatureInputSlotHeader>()`) by a
+/// dense row-major matrix of `num_rows * num_cols` elements encoded per [`FeatureDtype`],
+/// maintaining 64-byte alignment for vectorized machine-model execution.
+#[repr(C, align(64))]
+#[allow(clippy::pub_underscore_fields)]
+#[derive(
+    Default, Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable,
+)]
+pub struct FeatureInputSlotHeader {
+    /// Unique sequence or request identifier for this numerical input batch.
+    pub slot_seq_id: u64,
+    /// Number of feature rows (batch samples or sequence steps).
+    pub num_rows: u32,
+    /// Number of feature columns per row.
+    pub num_cols: u32,
+    /// Element encoding discriminator matching [`FeatureDtype`] (`0=F32`, `1=F16`, `2=I32`, `3=I8`).
+    pub dtype: u8,
+    /// Flag indicating pre-sanitized and normalized payload (`0 = raw`, `1 = normalized`).
+    pub normalized: u8,
+    /// Explicit alignment padding before [`Self::payload_bytes`].
+    pub _pad0: [u8; 6],
+    /// Exact serialized byte length of the trailing feature matrix payload.
+    pub payload_bytes: u64,
+    /// Schema/statistics hash binding this payload to its `MachineFeatureSchema`.
+    pub schema_hash: u64,
+    /// Reserved trailing bytes completing the 64-byte header footprint.
+    pub _reserved: [u8; 24],
+}
+
+impl FeatureInputSlotHeader {
+    /// Constructs a validated [`FeatureInputSlotHeader`] for a `num_rows` x `num_cols`
+    /// feature matrix of type `dtype`.
+    ///
+    /// # Errors
+    /// Returns [`K3Error::TensorBoundsError`] if either dimension is zero or the computed byte
+    /// span overflows `usize`.
+    pub fn new(
+        slot_seq_id: u64,
+        num_rows: u32,
+        num_cols: u32,
+        dtype: FeatureDtype,
+    ) -> Result<Self, K3Error> {
+        let payload_bytes = dtype.matrix_bytes(num_rows as usize, num_cols as usize)?;
+        Ok(Self {
+            slot_seq_id,
+            num_rows,
+            num_cols,
+            dtype: dtype.as_u8(),
+            normalized: 0,
+            _pad0: [0; 6],
+            payload_bytes: u64::try_from(payload_bytes).unwrap_or(u64::MAX),
+            schema_hash: 0,
+            _reserved: [0; 24],
+        })
+    }
+
+    /// Sets whether the serialized matrix payload is already normalized (`1`) or raw (`0`).
+    #[must_use]
+    pub const fn with_normalized(mut self, normalized: bool) -> Self {
+        self.normalized = if normalized { 1 } else { 0 };
+        self
+    }
+
+    /// Attaches a `MachineFeatureSchema` hash identifier to this slot header.
+    #[must_use]
+    pub const fn with_schema_hash(mut self, schema_hash: u64) -> Self {
+        self.schema_hash = schema_hash;
+        self
+    }
+
+    /// Decodes the [`FeatureDtype`] stored in [`Self::dtype`].
+    ///
+    /// # Errors
+    /// Returns [`K3Error::TensorBoundsError`] if [`Self::dtype`] is not a valid [`FeatureDtype`] tag.
+    pub fn feature_dtype(&self) -> Result<FeatureDtype, K3Error> {
+        FeatureDtype::from_u8(self.dtype)
+    }
+
+    /// Returns `true` if [`Self::normalized`] is non-zero.
+    #[must_use]
+    pub const fn is_normalized(&self) -> bool {
+        self.normalized != 0
+    }
+
+    /// Validates dtype tag, non-zero dimensions, `normalized` flag (`0` or `1`), and exact
+    /// consistency between [`Self::payload_bytes`] and `dtype.matrix_bytes(num_rows, num_cols)`.
+    ///
+    /// Returns the validated payload byte length on success.
+    ///
+    /// # Errors
+    /// Returns [`K3Error::TensorBoundsError`] on any invalid field or size mismatch.
+    pub fn validate(&self) -> Result<usize, K3Error> {
+        let dtype = self.feature_dtype()?;
+        if self.normalized > 1 {
+            return Err(K3Error::TensorBoundsError {
+                tensor_name: "feature_input_header".to_owned(),
+                offset: 0,
+                byte_len: size_of::<Self>(),
+                buffer_len: size_of::<Self>(),
+                reason: format!(
+                    "FeatureInputSlotHeader.normalized ({}) must be 0 or 1",
+                    self.normalized
+                ),
+            });
+        }
+        let expected_bytes = dtype.matrix_bytes(self.num_rows as usize, self.num_cols as usize)?;
+        let declared_bytes =
+            usize::try_from(self.payload_bytes).map_err(|_| K3Error::TensorBoundsError {
+                tensor_name: "feature_input_header".to_owned(),
+                offset: 0,
+                byte_len: usize::MAX,
+                buffer_len: 0,
+                reason: format!(
+                    "FeatureInputSlotHeader.payload_bytes ({}) exceeds usize",
+                    self.payload_bytes
+                ),
+            })?;
+        if declared_bytes != expected_bytes {
+            return Err(K3Error::TensorBoundsError {
+                tensor_name: "feature_input_header".to_owned(),
+                offset: 0,
+                byte_len: expected_bytes,
+                buffer_len: declared_bytes,
+                reason: format!(
+                    "FeatureInputSlotHeader.payload_bytes ({declared_bytes}) does not match expected {expected_bytes} bytes for {}x{} {dtype:?}",
+                    self.num_rows, self.num_cols
+                ),
+            });
+        }
+        Ok(expected_bytes)
+    }
+}
+
+/// Validates a raw little-endian numerical feature payload upfront for length consistency and
+/// absence of `NaN`/`±Inf` values (for [`FeatureDtype::F32`] and [`FeatureDtype::F16`]).
+///
+/// Returns the validated byte length (`payload.len()`) on success.
+///
+/// # Errors
+/// Returns [`K3Error::TensorBoundsError`] if dimensions are zero, byte size overflows,
+/// `payload.len()` mismatches `dtype.matrix_bytes(num_rows, num_cols)`, or any `F32`/`F16`
+/// element is non-finite.
+pub fn validate_feature_payload(
+    dtype: FeatureDtype,
+    num_rows: usize,
+    num_cols: usize,
+    payload: &[u8],
+) -> Result<usize, K3Error> {
+    let expected_bytes = dtype.matrix_bytes(num_rows, num_cols)?;
+    if payload.len() != expected_bytes {
+        return Err(K3Error::TensorBoundsError {
+            tensor_name: "feature_input".to_owned(),
+            offset: 0,
+            byte_len: expected_bytes,
+            buffer_len: payload.len(),
+            reason: format!(
+                "feature payload byte length ({}) does not match expected {expected_bytes} bytes for {num_rows}x{num_cols} {dtype:?}",
+                payload.len()
+            ),
+        });
+    }
+    match dtype {
+        FeatureDtype::F32 => {
+            for (idx, chunk) in payload.chunks_exact(4).enumerate() {
+                let val = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                if !val.is_finite() {
+                    return Err(K3Error::TensorBoundsError {
+                        tensor_name: "feature_input".to_owned(),
+                        offset: idx.saturating_mul(4),
+                        byte_len: 4,
+                        buffer_len: payload.len(),
+                        reason: format!("non-finite F32 feature value ({val}) at element {idx}"),
+                    });
+                }
+            }
+        }
+        FeatureDtype::F16 => {
+            for (idx, chunk) in payload.chunks_exact(2).enumerate() {
+                let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
+                let val = f16_bits_to_f32(bits);
+                if !val.is_finite() {
+                    return Err(K3Error::TensorBoundsError {
+                        tensor_name: "feature_input".to_owned(),
+                        offset: idx.saturating_mul(2),
+                        byte_len: 2,
+                        buffer_len: payload.len(),
+                        reason: format!(
+                            "non-finite F16 feature value (0x{bits:04x}) at element {idx}"
+                        ),
+                    });
+                }
+            }
+        }
+        FeatureDtype::I32 | FeatureDtype::I8 => {}
+    }
+    Ok(expected_bytes)
+}
+
+/// Decodes a little-endian numerical feature payload of `dtype` into `out` as finite `f32` values.
+///
+/// Validates dimensions, byte length, and upfront `NaN`/`Inf` rejection before writing any element
+/// into `out`.
+///
+/// # Errors
+/// Returns [`K3Error::TensorBoundsError`] if validation fails or `out.len() != num_rows * num_cols`.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "integer i32 machine features intentionally convert to f32 for uniform kernel dispatch"
+)]
+pub fn decode_feature_payload_to_f32(
+    dtype: FeatureDtype,
+    num_rows: usize,
+    num_cols: usize,
+    payload: &[u8],
+    out: &mut [f32],
+) -> Result<(), K3Error> {
+    validate_feature_payload(dtype, num_rows, num_cols, payload)?;
+    let expected_elems = num_rows * num_cols;
+    if out.len() != expected_elems {
+        return Err(K3Error::TensorBoundsError {
+            tensor_name: "feature_input".to_owned(),
+            offset: 0,
+            byte_len: expected_elems.saturating_mul(size_of::<f32>()),
+            buffer_len: out.len().saturating_mul(size_of::<f32>()),
+            reason: format!(
+                "decoded feature output slice length ({}) does not match expected {expected_elems}",
+                out.len()
+            ),
+        });
+    }
+    match dtype {
+        FeatureDtype::F32 => {
+            for (dst, chunk) in out.iter_mut().zip(payload.chunks_exact(4)) {
+                *dst = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            }
+        }
+        FeatureDtype::F16 => {
+            for (dst, chunk) in out.iter_mut().zip(payload.chunks_exact(2)) {
+                let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
+                *dst = f16_bits_to_f32(bits);
+            }
+        }
+        FeatureDtype::I32 => {
+            for (dst, chunk) in out.iter_mut().zip(payload.chunks_exact(4)) {
+                *dst = i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) as f32;
+            }
+        }
+        FeatureDtype::I8 => {
+            for (dst, &byte) in out.iter_mut().zip(payload.iter()) {
+                *dst = f32::from(i8::from_le_bytes([byte]));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "shared validated header + payload builder for slice and SharedMemoryArena slot writers"
+)]
+pub(super) fn build_validated_feature_slot(
+    slot_seq_id: u64,
+    dtype: FeatureDtype,
+    num_rows: usize,
+    num_cols: usize,
+    payload: &[u8],
+    normalized: bool,
+    schema_hash: u64,
+    buffer_len: usize,
+) -> Result<(FeatureInputSlotHeader, usize), K3Error> {
+    let rows_u32 = u32::try_from(num_rows).map_err(|_| K3Error::TensorBoundsError {
+        tensor_name: "feature_input".to_owned(),
+        offset: 0,
+        byte_len: usize::MAX,
+        buffer_len,
+        reason: format!("num_rows ({num_rows}) exceeds u32::MAX"),
+    })?;
+    let cols_u32 = u32::try_from(num_cols).map_err(|_| K3Error::TensorBoundsError {
+        tensor_name: "feature_input".to_owned(),
+        offset: 0,
+        byte_len: usize::MAX,
+        buffer_len,
+        reason: format!("num_cols ({num_cols}) exceeds u32::MAX"),
+    })?;
+    let payload_len = validate_feature_payload(dtype, num_rows, num_cols, payload)?;
+    let header_len = size_of::<FeatureInputSlotHeader>();
+    let total_bytes =
+        header_len
+            .checked_add(payload_len)
+            .ok_or_else(|| K3Error::TensorBoundsError {
+                tensor_name: "feature_input_slot".to_owned(),
+                offset: 0,
+                byte_len: usize::MAX,
+                buffer_len,
+                reason: "feature slot total byte length overflowed usize".to_owned(),
+            })?;
+    let header = FeatureInputSlotHeader::new(slot_seq_id, rows_u32, cols_u32, dtype)?
+        .with_normalized(normalized)
+        .with_schema_hash(schema_hash);
+    Ok((header, total_bytes))
+}
+
+/// Serializes a validated [`FeatureInputSlotHeader`] and its raw little-endian payload into `dst`.
+///
+/// Rejects non-finite (`NaN`/`±Inf`) elements, invalid dimensions, or undersized `dst` upfront
+/// before mutating `dst`, returning total bytes written (`64 + payload.len()`).
+///
+/// # Errors
+/// Returns [`K3Error::TensorBoundsError`] if dimensions exceed `u32::MAX`, payload validation fails,
+/// or `dst.len()` cannot fit header plus payload.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "slot writer exposes explicit metadata and typed matrix bounds without hidden state"
+)]
+pub fn write_feature_slot_to_slice(
+    dst: &mut [u8],
+    slot_seq_id: u64,
+    dtype: FeatureDtype,
+    num_rows: usize,
+    num_cols: usize,
+    payload: &[u8],
+    normalized: bool,
+    schema_hash: u64,
+) -> Result<usize, K3Error> {
+    let (header, total_bytes) = build_validated_feature_slot(
+        slot_seq_id,
+        dtype,
+        num_rows,
+        num_cols,
+        payload,
+        normalized,
+        schema_hash,
+        dst.len(),
+    )?;
+    if dst.len() < total_bytes {
+        return Err(K3Error::TensorBoundsError {
+            tensor_name: "feature_input_slot".to_owned(),
+            offset: 0,
+            byte_len: total_bytes,
+            buffer_len: dst.len(),
+            reason: format!(
+                "destination buffer length ({}) smaller than required {total_bytes} bytes",
+                dst.len()
+            ),
+        });
+    }
+    let header_len = size_of::<FeatureInputSlotHeader>();
+    dst[..header_len].copy_from_slice(header.as_bytes());
+    dst[header_len..total_bytes].copy_from_slice(payload);
+    Ok(total_bytes)
+}
+
+/// Reads and validates a [`FeatureInputSlotHeader`] and its payload byte slice from `src`.
+///
+/// Re-verifies upfront that `F32`/`F16` elements contain no `NaN` or `±Inf` values.
+///
+/// # Errors
+/// Returns [`K3Error::TensorBoundsError`] if `src` is undersized, header fields fail validation,
+/// or the payload fails bounds or finiteness checks.
+pub fn read_feature_slot_from_slice(
+    src: &[u8],
+) -> Result<(FeatureInputSlotHeader, &[u8]), K3Error> {
+    let header_len = size_of::<FeatureInputSlotHeader>();
+    if src.len() < header_len {
+        return Err(K3Error::TensorBoundsError {
+            tensor_name: "feature_input_header".to_owned(),
+            offset: 0,
+            byte_len: header_len,
+            buffer_len: src.len(),
+            reason: format!(
+                "source buffer length ({}) smaller than {header_len}-byte FeatureInputSlotHeader",
+                src.len()
+            ),
+        });
+    }
+    let header = FeatureInputSlotHeader::read_from_bytes(&src[..header_len]).map_err(|e| {
+        K3Error::TensorBoundsError {
+            tensor_name: "feature_input_header".to_owned(),
+            offset: 0,
+            byte_len: header_len,
+            buffer_len: src.len(),
+            reason: format!("failed to decode FeatureInputSlotHeader: {e}"),
+        }
+    })?;
+    let payload_len = header.validate()?;
+    let end = header_len
+        .checked_add(payload_len)
+        .ok_or_else(|| K3Error::TensorBoundsError {
+            tensor_name: "feature_input_slot".to_owned(),
+            offset: header_len,
+            byte_len: usize::MAX,
+            buffer_len: src.len(),
+            reason: "feature slot end offset overflowed usize".to_owned(),
+        })?;
+    if src.len() < end {
+        return Err(K3Error::TensorBoundsError {
+            tensor_name: "feature_input_slot".to_owned(),
+            offset: header_len,
+            byte_len: payload_len,
+            buffer_len: src.len(),
+            reason: format!(
+                "source buffer length ({}) smaller than expected feature slot end {end}",
+                src.len()
+            ),
+        });
+    }
+    let payload = &src[header_len..end];
+    validate_feature_payload(
+        header.feature_dtype()?,
+        header.num_rows as usize,
+        header.num_cols as usize,
+        payload,
+    )?;
+    Ok((header, payload))
+}
+
 // Compile-time layout invariants verification
 const _: () = {
     assert!(size_of::<ArenaHeader>() == 128);
@@ -796,6 +1350,9 @@ const _: () = {
 
     assert!(size_of::<RecurrentStateSlotHeader>() == 64);
     assert!(align_of::<RecurrentStateSlotHeader>() == 64);
+
+    assert!(size_of::<FeatureInputSlotHeader>() == 64);
+    assert!(align_of::<FeatureInputSlotHeader>() == 64);
 };
 
 #[cfg(test)]
@@ -1095,5 +1652,247 @@ mod tests {
         assert_eq!(hdr.commit_step(2).unwrap(), 0);
         assert_eq!(hdr.committed_step, 2);
         assert_eq!(hdr.active_bank_offset_bytes(), hdr.slot_0_offset_bytes());
+    }
+
+    #[test]
+    fn test_feature_dtype_and_header_layout() {
+        assert_eq!(size_of::<FeatureInputSlotHeader>(), CACHELINE_ALIGNMENT);
+        assert_eq!(align_of::<FeatureInputSlotHeader>(), CACHELINE_ALIGNMENT);
+
+        assert_eq!(FeatureDtype::F32.as_u8(), FEATURE_DTYPE_F32);
+        assert_eq!(FeatureDtype::F16.as_u8(), FEATURE_DTYPE_F16);
+        assert_eq!(FeatureDtype::I32.as_u8(), FEATURE_DTYPE_I32);
+        assert_eq!(FeatureDtype::I8.as_u8(), FEATURE_DTYPE_I8);
+        assert_eq!(FeatureDtype::F32.element_bytes(), 4);
+        assert_eq!(FeatureDtype::F16.element_bytes(), 2);
+        assert_eq!(FeatureDtype::I32.element_bytes(), 4);
+        assert_eq!(FeatureDtype::I8.element_bytes(), 1);
+        assert_eq!(FeatureDtype::from_u8(0).unwrap(), FeatureDtype::F32);
+        assert_eq!(FeatureDtype::from_u8(1).unwrap(), FeatureDtype::F16);
+        assert_eq!(FeatureDtype::from_u8(2).unwrap(), FeatureDtype::I32);
+        assert_eq!(FeatureDtype::from_u8(3).unwrap(), FeatureDtype::I8);
+        assert!(FeatureDtype::from_u8(4).is_err());
+
+        assert_eq!(FeatureDtype::F16.matrix_bytes(3, 4).unwrap(), 24);
+        assert!(FeatureDtype::F32.matrix_bytes(0, 4).is_err());
+        assert!(FeatureDtype::F32.matrix_bytes(4, 0).is_err());
+        assert!(FeatureDtype::F32.matrix_bytes(usize::MAX, 2).is_err());
+
+        let hdr = FeatureInputSlotHeader::new(42, 3, 4, FeatureDtype::F16)
+            .unwrap()
+            .with_normalized(true)
+            .with_schema_hash(0xDEAD_BEEF_CAFE_BABE);
+        assert_eq!(hdr.validate().unwrap(), 24);
+        assert!(hdr.is_normalized());
+        assert_eq!(hdr.feature_dtype().unwrap(), FeatureDtype::F16);
+
+        let recovered =
+            FeatureInputSlotHeader::read_from_bytes(hdr.as_bytes()).expect("zerocopy roundtrip");
+        assert_eq!(recovered, hdr);
+
+        let mut bad_dtype = hdr;
+        bad_dtype.dtype = 9;
+        assert!(bad_dtype.validate().is_err());
+
+        let mut bad_norm = hdr;
+        bad_norm.normalized = 2;
+        assert!(bad_norm.validate().is_err());
+
+        let mut bad_bytes = hdr;
+        bad_bytes.payload_bytes = 12;
+        assert!(bad_bytes.validate().is_err());
+    }
+
+    #[test]
+    fn test_f16_bits_to_f32_edge_cases() {
+        assert_eq!(f16_bits_to_f32(0x0000).to_bits(), 0.0_f32.to_bits());
+        assert_eq!(f16_bits_to_f32(0x8000).to_bits(), (-0.0_f32).to_bits());
+        assert_eq!(f16_bits_to_f32(0x3C00).to_bits(), 1.0_f32.to_bits());
+        assert_eq!(f16_bits_to_f32(0xC000).to_bits(), (-2.0_f32).to_bits());
+        assert_eq!(f16_bits_to_f32(0x7BFF).to_bits(), 65_504.0_f32.to_bits());
+        assert_eq!(
+            f16_bits_to_f32(0x0001).to_bits(),
+            (1.0_f32 / 16_777_216.0_f32).to_bits()
+        );
+        assert_eq!(
+            f16_bits_to_f32(0x03FF).to_bits(),
+            (1023.0_f32 / 16_777_216.0_f32).to_bits()
+        );
+        assert!(
+            f16_bits_to_f32(0x7C00).is_infinite() && f16_bits_to_f32(0x7C00).is_sign_positive()
+        );
+        assert!(
+            f16_bits_to_f32(0xFC00).is_infinite() && f16_bits_to_f32(0xFC00).is_sign_negative()
+        );
+        assert!(f16_bits_to_f32(0x7E00).is_nan());
+        assert!(f16_bits_to_f32(0x7C01).is_nan());
+    }
+
+    #[test]
+    fn test_feature_slot_slice_roundtrip_all_dtypes() {
+        // F32
+        let mut buf = [0_u8; 128];
+        let f32_vals = [1.5_f32, -2.25, 0.0, 4.75];
+        let mut f32_bytes = [0_u8; 16];
+        for (idx, val) in f32_vals.iter().enumerate() {
+            f32_bytes[idx * 4..(idx + 1) * 4].copy_from_slice(&val.to_le_bytes());
+        }
+        let written = write_feature_slot_to_slice(
+            &mut buf,
+            10,
+            FeatureDtype::F32,
+            2,
+            2,
+            &f32_bytes,
+            true,
+            111,
+        )
+        .unwrap();
+        assert_eq!(written, 64 + 16);
+        let (hdr, payload) = read_feature_slot_from_slice(&buf[..written]).unwrap();
+        assert_eq!(hdr.slot_seq_id, 10);
+        assert_eq!(hdr.schema_hash, 111);
+        assert!(hdr.is_normalized());
+        let mut decoded = [0.0_f32; 4];
+        decode_feature_payload_to_f32(FeatureDtype::F32, 2, 2, payload, &mut decoded).unwrap();
+        for (a, b) in decoded.iter().zip(f32_vals.iter()) {
+            assert_eq!(a.to_bits(), b.to_bits());
+        }
+
+        // F16 (1.0, -2.0, 0.5, 65504.0)
+        let f16_bits: [u16; 4] = [0x3C00, 0xC000, 0x3800, 0x7BFF];
+        let mut f16_bytes = [0_u8; 8];
+        for (idx, bits) in f16_bits.iter().enumerate() {
+            f16_bytes[idx * 2..(idx + 1) * 2].copy_from_slice(&bits.to_le_bytes());
+        }
+        let written = write_feature_slot_to_slice(
+            &mut buf,
+            11,
+            FeatureDtype::F16,
+            2,
+            2,
+            &f16_bytes,
+            false,
+            222,
+        )
+        .unwrap();
+        assert_eq!(written, 64 + 8);
+        let (hdr, payload) = read_feature_slot_from_slice(&buf[..written]).unwrap();
+        assert_eq!(hdr.feature_dtype().unwrap(), FeatureDtype::F16);
+        decode_feature_payload_to_f32(FeatureDtype::F16, 2, 2, payload, &mut decoded).unwrap();
+        let f16_expected = [1.0_f32, -2.0, 0.5, 65_504.0];
+        for (a, b) in decoded.iter().zip(f16_expected.iter()) {
+            assert_eq!(a.to_bits(), b.to_bits());
+        }
+
+        // I32
+        let i32_vals = [-42_i32, 0, 17, 1024];
+        let mut i32_bytes = [0_u8; 16];
+        for (idx, val) in i32_vals.iter().enumerate() {
+            i32_bytes[idx * 4..(idx + 1) * 4].copy_from_slice(&val.to_le_bytes());
+        }
+        let written = write_feature_slot_to_slice(
+            &mut buf,
+            12,
+            FeatureDtype::I32,
+            4,
+            1,
+            &i32_bytes,
+            false,
+            333,
+        )
+        .unwrap();
+        let (_, payload) = read_feature_slot_from_slice(&buf[..written]).unwrap();
+        decode_feature_payload_to_f32(FeatureDtype::I32, 4, 1, payload, &mut decoded).unwrap();
+        let i32_expected = [-42.0_f32, 0.0, 17.0, 1024.0];
+        for (a, b) in decoded.iter().zip(i32_expected.iter()) {
+            assert_eq!(a.to_bits(), b.to_bits());
+        }
+
+        // I8
+        let i8_vals = [-128_i8, -1, 0, 127];
+        let i8_bytes: [u8; 4] = [
+            i8_vals[0].to_le_bytes()[0],
+            i8_vals[1].to_le_bytes()[0],
+            0,
+            127,
+        ];
+        let written = write_feature_slot_to_slice(
+            &mut buf,
+            13,
+            FeatureDtype::I8,
+            1,
+            4,
+            &i8_bytes,
+            false,
+            444,
+        )
+        .unwrap();
+        let (_, payload) = read_feature_slot_from_slice(&buf[..written]).unwrap();
+        decode_feature_payload_to_f32(FeatureDtype::I8, 1, 4, payload, &mut decoded).unwrap();
+        let i8_expected = [-128.0_f32, -1.0, 0.0, 127.0];
+        for (a, b) in decoded.iter().zip(i8_expected.iter()) {
+            assert_eq!(a.to_bits(), b.to_bits());
+        }
+    }
+
+    #[test]
+    fn test_feature_slot_slice_rejects_nan_inf_and_corrupt_bounds() {
+        let mut buf = [0xAA_u8; 128];
+
+        // Non-finite F32 (NaN, +Inf, -Inf) rejected upfront before mutating dst
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut payload = [0_u8; 8];
+            payload[0..4].copy_from_slice(&1.0_f32.to_le_bytes());
+            payload[4..8].copy_from_slice(&bad.to_le_bytes());
+            let err = write_feature_slot_to_slice(
+                &mut buf,
+                1,
+                FeatureDtype::F32,
+                1,
+                2,
+                &payload,
+                false,
+                0,
+            );
+            assert!(matches!(err, Err(K3Error::TensorBoundsError { .. })));
+            assert!(buf.iter().all(|&b| b == 0xAA));
+        }
+
+        // Non-finite F16 (+Inf = 0x7C00, -Inf = 0xFC00, NaN = 0x7E00) rejected upfront
+        for bad_bits in [0x7C00_u16, 0xFC00, 0x7E00] {
+            let mut payload = [0_u8; 4];
+            payload[0..2].copy_from_slice(&0x3C00_u16.to_le_bytes());
+            payload[2..4].copy_from_slice(&bad_bits.to_le_bytes());
+            let err = write_feature_slot_to_slice(
+                &mut buf,
+                2,
+                FeatureDtype::F16,
+                1,
+                2,
+                &payload,
+                false,
+                0,
+            );
+            assert!(matches!(err, Err(K3Error::TensorBoundsError { .. })));
+            assert!(buf.iter().all(|&b| b == 0xAA));
+        }
+
+        // Corrupt shared memory payload (e.g. NaN injected after write) rejected on read
+        let mut good_f32 = [0_u8; 8];
+        good_f32[0..4].copy_from_slice(&1.0_f32.to_le_bytes());
+        good_f32[4..8].copy_from_slice(&2.0_f32.to_le_bytes());
+        let written =
+            write_feature_slot_to_slice(&mut buf, 3, FeatureDtype::F32, 1, 2, &good_f32, true, 99)
+                .unwrap();
+        assert!(read_feature_slot_from_slice(&buf[..63]).is_err());
+        assert!(read_feature_slot_from_slice(&buf[..written - 1]).is_err());
+
+        // Inject NaN directly into payload inside buffer -> read_feature_slot_from_slice rejects
+        buf[64..68].copy_from_slice(&f32::NAN.to_le_bytes());
+        assert!(matches!(
+            read_feature_slot_from_slice(&buf[..written]),
+            Err(K3Error::TensorBoundsError { .. })
+        ));
     }
 }

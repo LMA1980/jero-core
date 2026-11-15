@@ -12,15 +12,18 @@ pub use arrow::{
 };
 pub use layout::{
     ARENA_MAGIC, ARENA_MAGIC_BYTES, ARENA_VERSION, ArenaHeader, BLOCK_SIZE_TOKENS,
-    CACHELINE_ALIGNMENT, KV_Q8_0_BLOCK_BYTES, KV_Q8_0_BLOCK_ELEMENTS, KvBlockMeta, KvBlockTag,
-    KvDtype, OutputSlabHeader, RecurrentStateSlotHeader, SLAB_STATUS_IDLE, SLAB_STATUS_READ,
-    SLAB_STATUS_WRITTEN, TAG_FREE, TAG_PERSIST, TAG_PURGE, TAG_VOLATILE, TokenInputSlotHeader,
-    estimate_recurrent_state_bytes,
+    CACHELINE_ALIGNMENT, FeatureDtype, FeatureInputSlotHeader, KV_Q8_0_BLOCK_BYTES,
+    KV_Q8_0_BLOCK_ELEMENTS, KvBlockMeta, KvBlockTag, KvDtype, OutputSlabHeader,
+    RecurrentStateSlotHeader, SLAB_STATUS_IDLE, SLAB_STATUS_READ, SLAB_STATUS_WRITTEN, TAG_FREE,
+    TAG_PERSIST, TAG_PURGE, TAG_VOLATILE, TokenInputSlotHeader, decode_feature_payload_to_f32,
+    estimate_recurrent_state_bytes, f16_bits_to_f32, read_feature_slot_from_slice,
+    validate_feature_payload, write_feature_slot_to_slice,
 };
 pub use protocol::{
     AllocateArenaRequest, AllocateArenaResponse, AttachArenaCommand, DeallocateArenaRequest,
-    DeallocateArenaResponse, FLAG_ERROR, FLAG_FD_ATTACHED, FLAG_RESPONSE, FRAME_HEADER_LEN,
-    FRAME_MAGIC, ForwardPassCommand, ForwardPassCompleted, GetArenaFdRequest, GetArenaFdResponse,
+    DeallocateArenaResponse, FEATURE_DTYPE_F16, FEATURE_DTYPE_F32, FEATURE_DTYPE_I8,
+    FEATURE_DTYPE_I32, FLAG_ERROR, FLAG_FD_ATTACHED, FLAG_RESPONSE, FRAME_HEADER_LEN, FRAME_MAGIC,
+    ForwardPassCommand, ForwardPassCompleted, GetArenaFdRequest, GetArenaFdResponse,
     IpcFrameHeader, IpcMessage, KV_DTYPE_F16, KV_DTYPE_F32, KV_DTYPE_Q8_0, MAX_PAYLOAD_LEN,
     PingRequest, PingResponse, ShutdownCommand, StatusCode, WorkerHeartbeatRequest,
     WorkerHeartbeatResponse, create_fory_codec, create_uds_socket_pair, global_fory, recv_frame,

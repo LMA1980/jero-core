@@ -30,10 +30,13 @@ pub use gguf::{
     TensorDescriptor, align_up,
 };
 pub use ipc::{
-    ArenaHeader, ArenaOptions, ArenaSocketExt, IpcError, IpcMessage, KV_DTYPE_F16, KV_DTYPE_F32,
-    KV_DTYPE_Q8_0, KV_Q8_0_BLOCK_BYTES, KV_Q8_0_BLOCK_ELEMENTS, KvBlockMeta, KvBlockTag, KvDtype,
-    OutputSlabHeader, RecurrentStateSlotHeader, SharedMemoryArena, StatusCode,
-    TokenInputSlotHeader, estimate_recurrent_state_bytes,
+    ArenaHeader, ArenaOptions, ArenaSocketExt, FEATURE_DTYPE_F16, FEATURE_DTYPE_F32,
+    FEATURE_DTYPE_I8, FEATURE_DTYPE_I32, FeatureDtype, FeatureInputSlotHeader, IpcError,
+    IpcMessage, KV_DTYPE_F16, KV_DTYPE_F32, KV_DTYPE_Q8_0, KV_Q8_0_BLOCK_BYTES,
+    KV_Q8_0_BLOCK_ELEMENTS, KvBlockMeta, KvBlockTag, KvDtype, OutputSlabHeader,
+    RecurrentStateSlotHeader, SharedMemoryArena, StatusCode, TokenInputSlotHeader,
+    decode_feature_payload_to_f32, estimate_recurrent_state_bytes, f16_bits_to_f32,
+    read_feature_slot_from_slice, validate_feature_payload, write_feature_slot_to_slice,
 };
 pub use manifest::ModelManifest;
 pub use profile::{
@@ -43,7 +46,9 @@ pub use profile::{
     ModelListResponse, ModelLoadAuditEvent, ModelProfile, PriorityClass, ProfileStatus,
     QuantizationInfo, TuningAdvisory, TuningProfile,
 };
-pub use recipe::{ArchRecipe, ExecutionContext, KvCacheView, KvGeometry};
+pub use recipe::{
+    ArchRecipe, ExecutionContext, KvCacheView, KvGeometry, sanitize_and_normalize_features,
+};
 pub use sampling::{SamplingParams, StopCriteria, StopReason, TokenSampler};
 pub use scratch::{
     SCRATCH_ALIGNMENT, ScratchCheckpoint, ScratchElement, ScratchScope, ScratchWorkspace,
