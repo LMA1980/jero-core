@@ -374,8 +374,7 @@ fn test_challenge_openai_model_list_collection_response() {
     assert_eq!(deserialized.data.len(), 20);
 
     // Verify unprofiled vs profiled attributes in collection
-    for i in 0..10 {
-        let entry = &deserialized.data[i];
+    for entry in &deserialized.data[..10] {
         assert!(entry.unprofiled);
         assert_eq!(entry.profile_status, "unprofiled");
         assert_eq!(entry.cluster, "x100");
@@ -383,8 +382,7 @@ fn test_challenge_openai_model_list_collection_response() {
         assert!(entry.advisory_notice.is_some());
     }
 
-    for i in 10..20 {
-        let entry = &deserialized.data[i];
+    for entry in &deserialized.data[10..20] {
         assert!(!entry.unprofiled);
         assert_eq!(entry.profile_status, "profiled");
         assert_eq!(entry.priority_class, "latency");
