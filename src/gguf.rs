@@ -629,6 +629,28 @@ pub struct TensorDescriptor {
 }
 
 impl TensorDescriptor {
+    /// Constructs a validated tensor descriptor for internal parser implementations.
+    #[must_use]
+    pub(crate) const fn new(
+        name: String,
+        quant: QuantType,
+        shape: Vec<usize>,
+        num_elements: usize,
+        relative_offset: usize,
+        absolute_offset: usize,
+        byte_len: usize,
+    ) -> Self {
+        Self {
+            name,
+            quant,
+            shape,
+            num_elements,
+            relative_offset,
+            absolute_offset,
+            byte_len,
+        }
+    }
+
     /// Returns the tensor identifier name.
     #[must_use]
     pub fn name(&self) -> &str {
@@ -1348,6 +1370,78 @@ impl ModelMetadata {
             }
         }
     }
+
+    /// Constructs a [`ModelMetadata`] instance from internal parser-extracted parts.
+    #[must_use]
+    pub(crate) fn from_parts(parts: ModelMetadataParts) -> Self {
+        Self {
+            architecture: parts.architecture,
+            layer_count: parts.layer_count,
+            embedding_dim: parts.embedding_dim,
+            head_count: parts.head_count,
+            head_count_kv: parts.head_count_kv,
+            context_length: parts.context_length,
+            alignment: parts.alignment,
+            tensor_count: parts.tensor_count,
+            total_weight_bytes: parts.total_weight_bytes,
+            tensors: parts.tensors,
+            dory: None,
+            kv_lora_rank: None,
+            qk_rope_head_dim: None,
+            q_lora_rank: None,
+            qk_nope_head_dim: parts.qk_nope_head_dim,
+            v_head_dim: parts.v_head_dim,
+            expert_count: parts.expert_count,
+            expert_used_count: parts.expert_used_count,
+            expert_shared_count: None,
+            expert_feed_forward_length: None,
+            head_count_kv_per_layer: Vec::new(),
+            ssm_conv_kernel: None,
+            ssm_inner_size: None,
+            ssm_state_size: None,
+            ssm_time_step_rank: None,
+            ssm_group_count: None,
+            shortconv_l_cache: None,
+            wkv_head_size: None,
+            embedding_scale: None,
+            residual_scale: None,
+            attention_scale: None,
+            logit_scale: None,
+            feed_forward_length: parts.feed_forward_length,
+            rope_freq_base: parts.rope_freq_base,
+            rope_dimension_count: parts.rope_dimension_count,
+            rms_norm_eps: parts.rms_norm_eps,
+            sliding_window: parts.sliding_window,
+            vocab_size: parts.vocab_size,
+            attn_logit_softcapping: None,
+            final_logit_softcapping: None,
+        }
+    }
+}
+
+/// Internal builder struct used by sibling parsers (such as `SafeTensors`) to construct [`ModelMetadata`].
+#[derive(Debug, Default)]
+pub(crate) struct ModelMetadataParts {
+    pub(crate) architecture: String,
+    pub(crate) layer_count: usize,
+    pub(crate) embedding_dim: usize,
+    pub(crate) head_count: usize,
+    pub(crate) head_count_kv: usize,
+    pub(crate) context_length: usize,
+    pub(crate) alignment: usize,
+    pub(crate) tensor_count: usize,
+    pub(crate) total_weight_bytes: usize,
+    pub(crate) tensors: Vec<TensorDescriptor>,
+    pub(crate) qk_nope_head_dim: Option<usize>,
+    pub(crate) v_head_dim: Option<usize>,
+    pub(crate) expert_count: Option<usize>,
+    pub(crate) expert_used_count: Option<usize>,
+    pub(crate) feed_forward_length: Option<usize>,
+    pub(crate) rope_freq_base: Option<f32>,
+    pub(crate) rope_dimension_count: Option<usize>,
+    pub(crate) rms_norm_eps: Option<f32>,
+    pub(crate) sliding_window: Option<usize>,
+    pub(crate) vocab_size: Option<usize>,
 }
 
 struct RawTensorInfo {

@@ -9,6 +9,7 @@ pub mod ipc;
 pub mod manifest;
 pub mod profile;
 pub mod recipe;
+pub mod safetensors;
 pub mod sampling;
 pub mod scratch;
 pub mod tensor;
@@ -47,8 +48,10 @@ pub use profile::{
     QuantizationInfo, TuningAdvisory, TuningProfile,
 };
 pub use recipe::{
-    ArchRecipe, ExecutionContext, KvCacheView, KvGeometry, sanitize_and_normalize_features,
+    ArchRecipe, EmbeddingPooling, ExecutionContext, KvCacheView, KvGeometry,
+    sanitize_and_normalize_features,
 };
+pub use safetensors::{MAX_SAFETENSORS_HEADER_BYTES, SafeTensorsFile};
 pub use sampling::{SamplingParams, StopCriteria, StopReason, TokenSampler};
 pub use scratch::{
     SCRATCH_ALIGNMENT, ScratchCheckpoint, ScratchElement, ScratchScope, ScratchWorkspace,
