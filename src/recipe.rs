@@ -443,6 +443,67 @@ impl<'a> KvCacheView<'a> {
     }
 }
 
+/// Pooling strategy for dense encoder embedding output buffers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum EmbeddingPooling {
+    /// Preserve raw unpooled hidden states or caller-managed embedding outputs.
+    #[default]
+    None,
+    /// Mean-pool hidden states across all sequence token positions.
+    Mean,
+    /// Extract the `[CLS]` token representation at sequence position `0`.
+    Cls,
+    /// Extract the final active token representation at sequence position `seq_len - 1`.
+    LastToken,
+}
+
+impl EmbeddingPooling {
+    /// Returns the canonical string identifier for this pooling strategy.
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Mean => "mean",
+            Self::Cls => "cls",
+            Self::LastToken => "last_token",
+        }
+    }
+
+    /// Maps the pooling strategy to the kernel `mode_code` (`1 = Mean`, `2 = Cls`, `3 = LastToken`),
+    /// returning `None` when [`Self::None`] is selected.
+    #[must_use]
+    pub const fn mode_code(self) -> Option<u8> {
+        match self {
+            Self::None => None,
+            Self::Mean => Some(1),
+            Self::Cls => Some(2),
+            Self::LastToken => Some(3),
+        }
+    }
+}
+
+#[derive(Debug)]
+enum CrossAttnKvBuffer<'a> {
+    Mutable(&'a mut [f32]),
+    ReadOnly(&'a [f32]),
+}
+
+impl CrossAttnKvBuffer<'_> {
+    fn as_slice(&self) -> &[f32] {
+        match self {
+            Self::Mutable(buf) => buf,
+            Self::ReadOnly(buf) => buf,
+        }
+    }
+
+    fn as_mut_slice(&mut self) -> Option<&mut [f32]> {
+        match self {
+            Self::Mutable(buf) => Some(buf),
+            Self::ReadOnly(_) => None,
+        }
+    }
+}
+
 /// Single-prompt execution context enforcing strict cycle exclusivity (no cross-prompt batching
 /// per ADR-005) and fixed `n_ctx` context window bounds (per ADR-027).
 #[derive(Debug)]
@@ -461,6 +522,15 @@ pub struct ExecutionContext<'a> {
     feature_dims: Option<(usize, usize)>,
     soft_prompt_embeds: Option<&'a [f32]>,
     soft_prompt_dims: Option<(usize, usize)>,
+    embedding_output: Option<&'a mut [f32]>,
+    embedding_pooling: EmbeddingPooling,
+    matryoshka_dim: Option<usize>,
+    vision_input: Option<&'a [f32]>,
+    vision_dims: Option<(usize, usize, usize)>,
+    audio_mel: Option<&'a [f32]>,
+    audio_dims: Option<(usize, usize)>,
+    cross_attn_kv: Option<CrossAttnKvBuffer<'a>>,
+    cross_attn_kv_dims: Option<(usize, usize)>,
 }
 
 impl<'a> ExecutionContext<'a> {
@@ -496,6 +566,15 @@ impl<'a> ExecutionContext<'a> {
             feature_dims: None,
             soft_prompt_embeds: None,
             soft_prompt_dims: None,
+            embedding_output: None,
+            embedding_pooling: EmbeddingPooling::None,
+            matryoshka_dim: None,
+            vision_input: None,
+            vision_dims: None,
+            audio_mel: None,
+            audio_dims: None,
+            cross_attn_kv: None,
+            cross_attn_kv_dims: None,
         })
     }
 
@@ -575,6 +654,15 @@ impl<'a> ExecutionContext<'a> {
             feature_dims: None,
             soft_prompt_embeds: None,
             soft_prompt_dims: None,
+            embedding_output: None,
+            embedding_pooling: EmbeddingPooling::None,
+            matryoshka_dim: None,
+            vision_input: None,
+            vision_dims: None,
+            audio_mel: None,
+            audio_dims: None,
+            cross_attn_kv: None,
+            cross_attn_kv_dims: None,
         })
     }
 
@@ -674,6 +762,238 @@ impl<'a> ExecutionContext<'a> {
     #[must_use]
     pub const fn soft_prompt_dims(&self) -> Option<(usize, usize)> {
         self.soft_prompt_dims
+    }
+
+    /// Attaches an output buffer for dense embedding generation along with the pooling strategy
+    /// and optional Matryoshka truncation dimension (`matryoshka_dim`).
+    ///
+    /// Rejects empty `out` buffers, `matryoshka_dim == Some(0)`, or `matryoshka_dim > out.len()`
+    /// upfront before mutating `self`.
+    ///
+    /// # Errors
+    /// Returns [`K3Error::TensorBoundsError`] if `out` is empty or `matryoshka_dim` is `Some(0)` or
+    /// exceeds `out.len()`.
+    pub fn with_embedding_output(
+        mut self,
+        out: &'a mut [f32],
+        pooling: EmbeddingPooling,
+        matryoshka_dim: Option<usize>,
+    ) -> Result<Self, K3Error> {
+        if out.is_empty() {
+            return Err(K3Error::TensorBoundsError {
+                tensor_name: "embedding_output".to_owned(),
+                offset: 0,
+                byte_len: size_of::<f32>(),
+                buffer_len: 0,
+                reason: "embedding_output buffer must be non-empty".to_owned(),
+            });
+        }
+        if let Some(dim) = matryoshka_dim
+            && (dim == 0 || dim > out.len())
+        {
+            return Err(K3Error::TensorBoundsError {
+                tensor_name: "embedding_output".to_owned(),
+                offset: 0,
+                byte_len: dim.saturating_mul(size_of::<f32>()),
+                buffer_len: size_of_val(out),
+                reason: format!(
+                    "matryoshka_dim ({dim}) must be non-zero and <= embedding_output length {}",
+                    out.len()
+                ),
+            });
+        }
+        self.embedding_output = Some(out);
+        self.embedding_pooling = pooling;
+        self.matryoshka_dim = matryoshka_dim;
+        Ok(self)
+    }
+
+    /// Returns an immutable view of the attached embedding output buffer, if configured.
+    #[must_use]
+    pub fn embedding_output(&self) -> Option<&[f32]> {
+        self.embedding_output.as_deref()
+    }
+
+    /// Returns a mutable view of the attached embedding output buffer, if configured.
+    pub fn embedding_output_mut(&mut self) -> Option<&mut [f32]> {
+        self.embedding_output.as_deref_mut()
+    }
+
+    /// Returns the configured [`EmbeddingPooling`] strategy (defaults to [`EmbeddingPooling::None`]).
+    #[must_use]
+    pub const fn embedding_pooling(&self) -> EmbeddingPooling {
+        self.embedding_pooling
+    }
+
+    /// Returns the configured optional Matryoshka truncation dimension, if any.
+    #[must_use]
+    pub const fn matryoshka_dim(&self) -> Option<usize> {
+        self.matryoshka_dim
+    }
+
+    /// Attaches a validated CHW `f32` vision pixel tensor (`channels` x `height` x `width`).
+    ///
+    /// # Errors
+    /// Returns [`K3Error::TensorBoundsError`] if any dimension is zero, `channels * height * width`
+    /// overflows `usize`, `pixels.len()` does not match the product, or any pixel is `NaN` or
+    /// `±Inf`.
+    pub fn with_vision_input(
+        mut self,
+        pixels: &'a [f32],
+        channels: usize,
+        height: usize,
+        width: usize,
+    ) -> Result<Self, K3Error> {
+        validate_finite_tensor("vision_input", pixels, &[channels, height, width])?;
+        self.vision_input = Some(pixels);
+        self.vision_dims = Some((channels, height, width));
+        Ok(self)
+    }
+
+    /// Returns the attached `f32` vision tensor slice, if configured.
+    #[must_use]
+    pub const fn vision_input(&self) -> Option<&'a [f32]> {
+        self.vision_input
+    }
+
+    /// Returns the dimensions `(channels, height, width)` of the attached vision input, if configured.
+    #[must_use]
+    pub const fn vision_dims(&self) -> Option<(usize, usize, usize)> {
+        self.vision_dims
+    }
+
+    /// Attaches a validated `f32` log-mel spectrogram matrix (`n_mels` x `n_frames`) for audio recipes.
+    ///
+    /// # Errors
+    /// Returns [`K3Error::TensorBoundsError`] if `n_mels` or `n_frames` is zero, `n_mels * n_frames`
+    /// overflows `usize`, `mel.len()` does not match the product, or any element is `NaN` or `±Inf`.
+    pub fn with_audio_mel(
+        mut self,
+        mel: &'a [f32],
+        n_mels: usize,
+        n_frames: usize,
+    ) -> Result<Self, K3Error> {
+        validate_finite_tensor("audio_mel", mel, &[n_mels, n_frames])?;
+        self.audio_mel = Some(mel);
+        self.audio_dims = Some((n_mels, n_frames));
+        Ok(self)
+    }
+
+    /// Returns the attached `f32` log-mel spectrogram slice, if configured.
+    #[must_use]
+    pub const fn audio_mel(&self) -> Option<&'a [f32]> {
+        self.audio_mel
+    }
+
+    /// Returns the dimensions `(n_mels, n_frames)` of the attached audio mel input, if configured.
+    #[must_use]
+    pub const fn audio_dims(&self) -> Option<(usize, usize)> {
+        self.audio_dims
+    }
+
+    /// Returns the dimensions `(n_mels, n_frames)` of the attached audio mel input (alias for [`Self::audio_dims`]).
+    #[must_use]
+    pub const fn audio_mel_dims(&self) -> Option<(usize, usize)> {
+        self.audio_dims
+    }
+
+    /// Attaches a mutable cross-attention KV buffer for encoder-decoder recipes.
+    ///
+    /// # Errors
+    /// Returns [`K3Error::TensorBoundsError`] if `kv` is empty or contains any non-finite (`NaN` or
+    /// `±Inf`) element.
+    pub fn with_cross_attn_kv(mut self, kv: &'a mut [f32]) -> Result<Self, K3Error> {
+        if kv.is_empty() {
+            return Err(K3Error::TensorBoundsError {
+                tensor_name: "cross_attn_kv".to_owned(),
+                offset: 0,
+                byte_len: size_of::<f32>(),
+                buffer_len: 0,
+                reason: "cross_attn_kv buffer must be non-empty".to_owned(),
+            });
+        }
+        validate_finite_elements("cross_attn_kv", kv)?;
+        self.cross_attn_kv = Some(CrossAttnKvBuffer::Mutable(kv));
+        self.cross_attn_kv_dims = None;
+        Ok(self)
+    }
+
+    /// Attaches a mutable shaped cross-attention KV buffer (`num_frames` x `hidden_dim`) for
+    /// encoder-decoder recipes.
+    ///
+    /// # Errors
+    /// Returns [`K3Error::TensorBoundsError`] if dimensions are zero, overflow `usize`, mismatch
+    /// `kv.len()`, or any element is `NaN` or `±Inf`.
+    pub fn with_cross_attn_kv_shaped(
+        mut self,
+        kv: &'a mut [f32],
+        num_frames: usize,
+        hidden_dim: usize,
+    ) -> Result<Self, K3Error> {
+        validate_finite_tensor("cross_attn_kv", kv, &[num_frames, hidden_dim])?;
+        self.cross_attn_kv = Some(CrossAttnKvBuffer::Mutable(kv));
+        self.cross_attn_kv_dims = Some((num_frames, hidden_dim));
+        Ok(self)
+    }
+
+    /// Attaches an immutable shaped cross-attention KV buffer (`num_frames` x `hidden_dim`) for
+    /// decoder-only steps consuming pre-encoded audio states.
+    ///
+    /// # Errors
+    /// Returns [`K3Error::TensorBoundsError`] if dimensions are zero, overflow `usize`, mismatch
+    /// `kv.len()`, or any element is `NaN` or `±Inf`.
+    pub fn with_cross_attn_kv_readonly(
+        mut self,
+        kv: &'a [f32],
+        num_frames: usize,
+        hidden_dim: usize,
+    ) -> Result<Self, K3Error> {
+        validate_finite_tensor("cross_attn_kv", kv, &[num_frames, hidden_dim])?;
+        self.cross_attn_kv = Some(CrossAttnKvBuffer::ReadOnly(kv));
+        self.cross_attn_kv_dims = Some((num_frames, hidden_dim));
+        Ok(self)
+    }
+
+    /// Returns an immutable view of the attached cross-attention KV buffer, if configured.
+    #[must_use]
+    pub fn cross_attn_kv(&self) -> Option<&[f32]> {
+        self.cross_attn_kv.as_ref().map(CrossAttnKvBuffer::as_slice)
+    }
+
+    /// Returns a mutable view of the attached cross-attention KV buffer, if configured as mutable.
+    pub fn cross_attn_kv_mut(&mut self) -> Option<&mut [f32]> {
+        self.cross_attn_kv
+            .as_mut()
+            .and_then(CrossAttnKvBuffer::as_mut_slice)
+    }
+
+    /// Returns the dimensions `(num_frames, hidden_dim)` of the attached cross-attention KV buffer,
+    /// when configured via a shaped builder.
+    #[must_use]
+    pub const fn cross_attn_kv_dims(&self) -> Option<(usize, usize)> {
+        self.cross_attn_kv_dims
+    }
+
+    /// Returns simultaneous mutable views of the embedding output buffer and optional [`ScratchWorkspace`].
+    pub fn embedding_and_scratch_mut(
+        &mut self,
+    ) -> (Option<&mut [f32]>, Option<&mut ScratchWorkspace>) {
+        (
+            self.embedding_output.as_deref_mut(),
+            self.scratch.as_deref_mut(),
+        )
+    }
+
+    /// Returns simultaneous mutable views of the cross-attention KV buffer and optional [`ScratchWorkspace`].
+    pub fn cross_attn_kv_and_scratch_mut(
+        &mut self,
+    ) -> (Option<&mut [f32]>, Option<&mut ScratchWorkspace>) {
+        (
+            self.cross_attn_kv
+                .as_mut()
+                .and_then(CrossAttnKvBuffer::as_mut_slice),
+            self.scratch.as_deref_mut(),
+        )
     }
 
     const fn effective_context_limit(&self) -> usize {
@@ -962,42 +1282,7 @@ const fn validate_context_range(
     Ok(end_pos)
 }
 
-fn validate_finite_matrix(
-    tensor_name: &str,
-    data: &[f32],
-    rows: usize,
-    cols: usize,
-) -> Result<(), K3Error> {
-    if rows == 0 || cols == 0 {
-        return Err(K3Error::TensorBoundsError {
-            tensor_name: tensor_name.to_owned(),
-            offset: 0,
-            byte_len: 0,
-            buffer_len: size_of_val(data),
-            reason: format!("{tensor_name} dimensions ({rows}x{cols}) must both be non-zero"),
-        });
-    }
-    let expected_len = rows
-        .checked_mul(cols)
-        .ok_or_else(|| K3Error::TensorBoundsError {
-            tensor_name: tensor_name.to_owned(),
-            offset: 0,
-            byte_len: usize::MAX,
-            buffer_len: size_of_val(data),
-            reason: format!("{tensor_name} dimensions ({rows}x{cols}) overflowed usize"),
-        })?;
-    if data.len() != expected_len {
-        return Err(K3Error::TensorBoundsError {
-            tensor_name: tensor_name.to_owned(),
-            offset: 0,
-            byte_len: expected_len.saturating_mul(size_of::<f32>()),
-            buffer_len: size_of_val(data),
-            reason: format!(
-                "{tensor_name} element count {} does not match expected {rows}x{cols} ({expected_len})",
-                data.len()
-            ),
-        });
-    }
+fn validate_finite_elements(tensor_name: &str, data: &[f32]) -> Result<(), K3Error> {
     for (idx, &val) in data.iter().enumerate() {
         if !val.is_finite() {
             return Err(K3Error::TensorBoundsError {
@@ -1010,6 +1295,52 @@ fn validate_finite_matrix(
         }
     }
     Ok(())
+}
+
+fn validate_finite_tensor(tensor_name: &str, data: &[f32], dims: &[usize]) -> Result<(), K3Error> {
+    if dims.is_empty() || dims.contains(&0) {
+        return Err(K3Error::TensorBoundsError {
+            tensor_name: tensor_name.to_owned(),
+            offset: 0,
+            byte_len: 0,
+            buffer_len: size_of_val(data),
+            reason: format!("{tensor_name} dimensions ({dims:?}) must all be non-zero"),
+        });
+    }
+    let mut expected_len = 1usize;
+    for &dim in dims {
+        expected_len = expected_len
+            .checked_mul(dim)
+            .ok_or_else(|| K3Error::TensorBoundsError {
+                tensor_name: tensor_name.to_owned(),
+                offset: 0,
+                byte_len: usize::MAX,
+                buffer_len: size_of_val(data),
+                reason: format!("{tensor_name} dimensions ({dims:?}) overflowed usize"),
+            })?;
+    }
+    if data.len() != expected_len {
+        return Err(K3Error::TensorBoundsError {
+            tensor_name: tensor_name.to_owned(),
+            offset: 0,
+            byte_len: expected_len.saturating_mul(size_of::<f32>()),
+            buffer_len: size_of_val(data),
+            reason: format!(
+                "{tensor_name} element count {} does not match expected shape {dims:?} ({expected_len})",
+                data.len()
+            ),
+        });
+    }
+    validate_finite_elements(tensor_name, data)
+}
+
+fn validate_finite_matrix(
+    tensor_name: &str,
+    data: &[f32],
+    rows: usize,
+    cols: usize,
+) -> Result<(), K3Error> {
+    validate_finite_tensor(tensor_name, data, &[rows, cols])
 }
 
 /// Validates finite feature matrices and applies z-score normalization clamped to
@@ -2114,5 +2445,208 @@ mod tests {
             sanitize_and_normalize_features(&mut [], &[], &means, &stds, 3.0),
             Err(K3Error::TensorBoundsError { .. })
         ));
+    }
+
+    #[test]
+    fn test_execution_context_multimodal_defaults_and_embedding_output() {
+        let mut logits = [0.0_f32; 4];
+        let mut kv_cache = [0.0_f32; 16];
+
+        let default_ctx =
+            ExecutionContext::new(&[1, 2], 8, &mut logits, &mut kv_cache).expect("valid ctx");
+        assert_eq!(default_ctx.embedding_pooling(), EmbeddingPooling::None);
+        assert_eq!(default_ctx.matryoshka_dim(), None);
+        assert!(default_ctx.embedding_output().is_none());
+        assert!(default_ctx.vision_input().is_none());
+        assert_eq!(default_ctx.vision_dims(), None);
+        assert!(default_ctx.audio_mel().is_none());
+        assert_eq!(default_ctx.audio_dims(), None);
+        assert_eq!(default_ctx.audio_mel_dims(), None);
+        assert!(default_ctx.cross_attn_kv().is_none());
+        assert_eq!(default_ctx.cross_attn_kv_dims(), None);
+
+        assert_eq!(EmbeddingPooling::default(), EmbeddingPooling::None);
+        assert_eq!(EmbeddingPooling::None.as_str(), "none");
+        assert_eq!(EmbeddingPooling::Mean.as_str(), "mean");
+        assert_eq!(EmbeddingPooling::Cls.as_str(), "cls");
+        assert_eq!(EmbeddingPooling::LastToken.as_str(), "last_token");
+        assert_eq!(EmbeddingPooling::None.mode_code(), None);
+        assert_eq!(EmbeddingPooling::Mean.mode_code(), Some(1));
+        assert_eq!(EmbeddingPooling::Cls.mode_code(), Some(2));
+        assert_eq!(EmbeddingPooling::LastToken.mode_code(), Some(3));
+
+        let mut emb_buf = [0.0_f32; 8];
+        let mut scratch = ScratchWorkspace::new(256).expect("scratch");
+        let mut ctx = ExecutionContext::new(&[10, 20], 8, &mut logits, &mut kv_cache)
+            .expect("ctx")
+            .with_scratch(&mut scratch)
+            .with_embedding_output(&mut emb_buf, EmbeddingPooling::Mean, Some(4))
+            .expect("valid embedding_output");
+
+        assert_eq!(ctx.embedding_pooling(), EmbeddingPooling::Mean);
+        assert_eq!(ctx.matryoshka_dim(), Some(4));
+        assert_eq!(ctx.embedding_output().map(<[f32]>::len), Some(8));
+
+        {
+            let (emb_opt, ws_opt) = ctx.embedding_and_scratch_mut();
+            let emb = emb_opt.expect("embedding output mut");
+            emb[..4].copy_from_slice(&[0.5, 0.5, 0.5, 0.5]);
+            assert!(ws_opt.is_some());
+        }
+        assert_eq!(
+            ctx.embedding_output_mut().expect("mut")[..4],
+            [0.5, 0.5, 0.5, 0.5]
+        );
+
+        // Reject empty embedding output and out-of-range Matryoshka dims
+        let mut empty_emb: [f32; 0] = [];
+        assert!(matches!(
+            ExecutionContext::new(&[1], 8, &mut logits, &mut kv_cache)
+                .expect("ctx")
+                .with_embedding_output(&mut empty_emb, EmbeddingPooling::Cls, None),
+            Err(K3Error::TensorBoundsError { .. })
+        ));
+        assert!(matches!(
+            ExecutionContext::new(&[1], 8, &mut logits, &mut kv_cache)
+                .expect("ctx")
+                .with_embedding_output(&mut emb_buf, EmbeddingPooling::LastToken, Some(0)),
+            Err(K3Error::TensorBoundsError { .. })
+        ));
+        assert!(matches!(
+            ExecutionContext::new(&[1], 8, &mut logits, &mut kv_cache)
+                .expect("ctx")
+                .with_embedding_output(&mut emb_buf, EmbeddingPooling::LastToken, Some(9)),
+            Err(K3Error::TensorBoundsError { .. })
+        ));
+    }
+
+    #[test]
+    fn test_execution_context_vision_audio_and_cross_attn_kv_valid() {
+        let mut logits = [0.0_f32; 4];
+        let mut kv_cache = [0.0_f32; 16];
+        let pixels = [0.1_f32; 3 * 2 * 4];
+        let mel = [-0.5_f32; 80 * 3];
+        let mut cross_kv = [0.25_f32; 12];
+        let mut scratch = ScratchWorkspace::new(256).expect("scratch");
+
+        let mut ctx = ExecutionContext::new(&[1, 2], 8, &mut logits, &mut kv_cache)
+            .expect("ctx")
+            .with_scratch(&mut scratch)
+            .with_vision_input(&pixels, 3, 2, 4)
+            .expect("valid vision input")
+            .with_audio_mel(&mel, 80, 3)
+            .expect("valid audio mel")
+            .with_cross_attn_kv(&mut cross_kv)
+            .expect("valid cross_attn_kv");
+
+        assert_eq!(ctx.vision_input(), Some(&pixels[..]));
+        assert_eq!(ctx.vision_dims(), Some((3, 2, 4)));
+        assert_eq!(ctx.audio_mel(), Some(&mel[..]));
+        assert_eq!(ctx.audio_dims(), Some((80, 3)));
+        assert_eq!(ctx.audio_mel_dims(), Some((80, 3)));
+        assert_eq!(ctx.cross_attn_kv(), Some(&[0.25_f32; 12][..]));
+        assert_eq!(ctx.cross_attn_kv_dims(), None);
+
+        {
+            let (kv_opt, ws_opt) = ctx.cross_attn_kv_and_scratch_mut();
+            let kv_mut = kv_opt.expect("mutable cross_attn_kv");
+            kv_mut[0] = 1.75;
+            assert!(ws_opt.is_some());
+        }
+        assert!((ctx.cross_attn_kv_mut().expect("mut")[0] - 1.75).abs() <= f32::EPSILON);
+
+        let mut shaped_kv = [0.0_f32; 6];
+        let ctx_shaped = ExecutionContext::new(&[1], 8, &mut logits, &mut kv_cache)
+            .expect("ctx")
+            .with_cross_attn_kv_shaped(&mut shaped_kv, 2, 3)
+            .expect("valid shaped cross_attn_kv");
+        assert_eq!(ctx_shaped.cross_attn_kv_dims(), Some((2, 3)));
+
+        let ro_kv = [1.0_f32; 6];
+        let mut ctx_ro = ExecutionContext::new(&[1], 8, &mut logits, &mut kv_cache)
+            .expect("ctx")
+            .with_cross_attn_kv_readonly(&ro_kv, 2, 3)
+            .expect("valid readonly cross_attn_kv");
+        assert_eq!(ctx_ro.cross_attn_kv(), Some(&ro_kv[..]));
+        assert_eq!(ctx_ro.cross_attn_kv_dims(), Some((2, 3)));
+        assert!(ctx_ro.cross_attn_kv_mut().is_none());
+    }
+
+    #[test]
+    fn test_execution_context_vision_audio_and_cross_attn_kv_rejections() {
+        let mut logits = [0.0_f32; 4];
+        let mut kv_cache = [0.0_f32; 16];
+        let pixels = [0.1_f32; 3 * 2 * 4];
+        let mel = [-0.5_f32; 80 * 3];
+
+        assert!(matches!(
+            ExecutionContext::new(&[1], 8, &mut logits, &mut kv_cache)
+                .expect("ctx")
+                .with_vision_input(&pixels, 0, 2, 4),
+            Err(K3Error::TensorBoundsError { .. })
+        ));
+        assert!(matches!(
+            ExecutionContext::new(&[1], 8, &mut logits, &mut kv_cache)
+                .expect("ctx")
+                .with_vision_input(&pixels, usize::MAX, 2, 2),
+            Err(K3Error::TensorBoundsError { .. })
+        ));
+        assert!(matches!(
+            ExecutionContext::new(&[1], 8, &mut logits, &mut kv_cache)
+                .expect("ctx")
+                .with_vision_input(&pixels, 3, 2, 3),
+            Err(K3Error::TensorBoundsError { .. })
+        ));
+        assert!(matches!(
+            ExecutionContext::new(&[1], 8, &mut logits, &mut kv_cache)
+                .expect("ctx")
+                .with_audio_mel(&mel, 0, 3),
+            Err(K3Error::TensorBoundsError { .. })
+        ));
+        assert!(matches!(
+            ExecutionContext::new(&[1], 8, &mut logits, &mut kv_cache)
+                .expect("ctx")
+                .with_audio_mel(&mel, usize::MAX, 2),
+            Err(K3Error::TensorBoundsError { .. })
+        ));
+        assert!(matches!(
+            ExecutionContext::new(&[1], 8, &mut logits, &mut kv_cache)
+                .expect("ctx")
+                .with_audio_mel(&mel, 80, 2),
+            Err(K3Error::TensorBoundsError { .. })
+        ));
+        let mut empty_kv: [f32; 0] = [];
+        assert!(matches!(
+            ExecutionContext::new(&[1], 8, &mut logits, &mut kv_cache)
+                .expect("ctx")
+                .with_cross_attn_kv(&mut empty_kv),
+            Err(K3Error::TensorBoundsError { .. })
+        ));
+
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let bad_pixels = [1.0_f32, bad, 0.5, 0.25];
+            assert!(matches!(
+                ExecutionContext::new(&[1], 8, &mut logits, &mut kv_cache)
+                    .expect("ctx")
+                    .with_vision_input(&bad_pixels, 1, 2, 2),
+                Err(K3Error::TensorBoundsError { .. })
+            ));
+
+            let bad_mel = [0.0_f32, bad, 1.0, 2.0];
+            assert!(matches!(
+                ExecutionContext::new(&[1], 8, &mut logits, &mut kv_cache)
+                    .expect("ctx")
+                    .with_audio_mel(&bad_mel, 2, 2),
+                Err(K3Error::TensorBoundsError { .. })
+            ));
+
+            let mut bad_kv = [0.0_f32, bad];
+            assert!(matches!(
+                ExecutionContext::new(&[1], 8, &mut logits, &mut kv_cache)
+                    .expect("ctx")
+                    .with_cross_attn_kv(&mut bad_kv),
+                Err(K3Error::TensorBoundsError { .. })
+            ));
+        }
     }
 }
